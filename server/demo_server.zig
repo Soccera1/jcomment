@@ -140,6 +140,5 @@ fn serveStatic(allocator: std.mem.Allocator, request: *std.http.Server.Request, 
 fn contentType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
     return "application/octet-stream";
 }

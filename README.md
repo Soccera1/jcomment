@@ -1,14 +1,13 @@
 # jcomment
 
-Lightweight C99/WebAssembly comment widget for ordinary web pages. The widget is compiled with `zig cc` directly, no Emscripten runtime.
+Lightweight JavaScript comment widget for ordinary web pages.
 
 ## What is included
 
-- `src/widget.c` - the C99 wasm renderer. It escapes comment data and returns compact HTML fragments.
-- `web/jcomment.js` - browser loader/custom element for `<j-comment-section>`.
+- `web/jcomment.js` - browser custom element for `<j-comment-section>`.
 - `demo/index.html` - static demo page.
 - `server/` - reusable handlers and adapters for common hosting environments.
-- `scripts/build.sh` - builds `dist/jcomment.wasm` and copies web/demo assets.
+- `scripts/build.sh` - copies the browser widget and demo assets without requiring Zig.
 
 ## Features
 
@@ -19,26 +18,48 @@ Lightweight C99/WebAssembly comment widget for ordinary web pages. The widget is
 - Newest, oldest, and top sorting.
 - Character counter and server-side length validation.
 - Fetch-compatible server core with pagination metadata.
-- Escaped HTML rendering in the C99 wasm module.
+- Escaped HTML rendering in the browser custom element.
 
 ## Requirements
 
-- Zig 0.14+
-- SQLite 3 CLI for the native CGI server
-- Node 24+ only for the JavaScript validation scripts and optional JavaScript adapters that use Node's native SQLite module
+- Node 24+ for the JavaScript validation scripts and JavaScript adapters that use Node's native SQLite module
+- SQLite 3 CLI only for the native CGI server
+- Zig 0.14+ only for building the native CGI server or local Zig demo runner
 
 ## Build
 
 ```sh
-./scripts/build.sh
+npm run build
 ```
 
 The build emits:
 
-- `dist/jcomment.wasm`
 - `dist/jcomment.js`
 - `dist/demo/index.html`
-- `dist/jcomment-cgi`
+
+This default build does not require Zig.
+
+To build the native CGI server:
+
+```sh
+npm run build:cgi
+```
+
+That emits `dist/jcomment-cgi` and requires Zig 0.14+.
+
+To build everything, including the CGI server and local demo runner:
+
+```sh
+npm run build:all
+```
+
+The default validation path also avoids Zig:
+
+```sh
+npm run check
+```
+
+Run `npm run check:cgi` or `npm run check:all` when you want to validate the Zig CGI server too.
 
 ## Try the demo
 
@@ -48,13 +69,14 @@ npm run demo
 
 Open `http://127.0.0.1:8787/demo/`. The demo runner is a small Zig HTTP server that serves `dist/` and delegates `/api/comments` to `dist/jcomment-cgi`.
 
+`npm run demo` requires Zig because it builds and runs the local Zig demo server. Deploying the browser widget, Express adapter, Vercel/Netlify adapters, or Cloudflare Worker does not require Zig.
+
 ## Embed
 
 ```html
 <script type="module" src="/jcomment.js"></script>
 <j-comment-section
   data-api="/api/comments"
-  data-wasm="/jcomment.wasm"
   data-thread="post-123"
 ></j-comment-section>
 ```
@@ -62,8 +84,8 @@ Open `http://127.0.0.1:8787/demo/`. The demo runner is a small Zig HTTP server t
 Use one `data-thread` value per article, page, product, or other discussion surface. Multiple widgets can point at the same `data-api` and `data-site`; their comments stay separate as long as their `data-thread` values are different.
 
 ```html
-<j-comment-section data-api="/api/comments" data-wasm="/jcomment.wasm" data-thread="article-a" data-site="example.com"></j-comment-section>
-<j-comment-section data-api="/api/comments" data-wasm="/jcomment.wasm" data-thread="article-b" data-site="example.com"></j-comment-section>
+<j-comment-section data-api="/api/comments" data-thread="article-a" data-site="example.com"></j-comment-section>
+<j-comment-section data-api="/api/comments" data-thread="article-b" data-site="example.com"></j-comment-section>
 ```
 
 The API accepts and returns JSON comments:
@@ -278,7 +300,9 @@ BROKEN_CONFIG=0
 
 ## Generic No-Node Server
 
-For generic hosting, use the native CGI binary built at `dist/jcomment-cgi`. It is written in Zig and compiled with `zig build-exe`; it does not require Node, npm, Bun, Emscripten, or a JavaScript runtime on the server.
+For generic hosting, use the native CGI binary built at `dist/jcomment-cgi`. It is written in Zig and compiled with `zig build-exe`; it does not require Node, npm, Bun, or a JavaScript runtime on the server.
+
+Build it explicitly with `npm run build:cgi`. The default `npm run build` does not build CGI and does not require Zig.
 
 The CGI binary supports the same basic API shape:
 

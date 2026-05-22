@@ -6,7 +6,12 @@
   "type": "module",
   "scripts": {
     "build": "./scripts/build.sh",
-    "check": "npm run build && node scripts/check-wasm.mjs && node scripts/check-server.mjs && node scripts/check-cloudflare-d1.mjs && ./scripts/check-cgi.sh",
-    "demo": "npm run build && ./dist/jcomment-demo"
+    "build:cgi": "./scripts/build-cgi.sh",
+    "build:demo": "./scripts/build-demo.sh",
+    "build:all": "./scripts/build-all.sh",
+    "check": "npm run build && node scripts/check-renderer.mjs && node scripts/check-server.mjs && node scripts/check-cloudflare-d1.mjs",
+    "check:cgi": "npm run build:cgi && ./scripts/check-cgi.sh",
+    "check:all": "npm run check && npm run check:cgi",
+    "demo": "npm run build:all && ./dist/jcomment-demo"
   }
 }

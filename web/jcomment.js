@@ -279,43 +279,8 @@ template.innerHTML = `
   </section>
 `;
 
-let wasmPromise;
-
-async function loadRenderer(url) {
-  if (!wasmPromise) {
-    wasmPromise = instantiateWasm(url);
-  }
-  const { instance } = await wasmPromise;
-  const { exports } = instance;
-  const memory = new Uint8Array(exports.memory.buffer);
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  return function render(comment) {
-    const author = encoder.encode(comment.author || "Anonymous");
-    const body = encoder.encode(comment.body || "");
-    const created = encoder.encode(formatDate(comment.createdAt));
-    const score = encoder.encode(scoreText(comment));
-
-    memory.set(author.slice(0, 96), exports.jcomment_author_ptr());
-    memory.set(body.slice(0, 2048), exports.jcomment_body_ptr());
-    memory.set(created.slice(0, 64), exports.jcomment_time_ptr());
-    memory.set(score.slice(0, 32), exports.jcomment_score_ptr());
-
-    const len = exports.jcomment_render(author.length, body.length, created.length, score.length);
-    const ptr = exports.jcomment_output_ptr();
-    return decoder.decode(memory.subarray(ptr, ptr + len));
-  };
-}
-
-async function instantiateWasm(url) {
-  const response = await fetch(url);
-  try {
-    return await WebAssembly.instantiateStreaming(Promise.resolve(response.clone()), {});
-  } catch {
-    const bytes = await response.arrayBuffer();
-    return WebAssembly.instantiate(bytes, {});
-  }
+function renderCommentHtml(comment) {
+  return `<header class="jc-comment__meta"><strong>${escapeHtml(comment.author || "Anonymous")}</strong><time>${escapeHtml(formatDate(comment.createdAt))}</time></header><p>${escapeHtml(comment.body || "").replace(/\n/g, "<br>")}</p><span class="jc-score">${escapeHtml(scoreText(comment))}</span>`;
 }
 
 function formatDate(value) {
@@ -376,7 +341,6 @@ customElements.define("j-comment-section", class extends HTMLElement {
     this.resetConfirmApi = this.dataset.resetConfirmApi || `${this.api.replace(/\/$/, "")}/reset/confirm`;
     this.thread = this.dataset.thread || location.pathname;
     this.site = this.dataset.site || location.host;
-    this.wasm = this.dataset.wasm || "/jcomment.wasm";
     this.limit = Number(this.dataset.limit || 100);
     this.storageKey = `jcomment:${this.thread}:author`;
     this.tokenKey = `jcomment:${this.site}:token`;
@@ -419,7 +383,6 @@ customElements.define("j-comment-section", class extends HTMLElement {
 
   async refresh() {
     try {
-      this.renderComment = await loadRenderer(this.wasm);
       const response = await fetch(this.apiUrl());
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = normalizePayload(await response.json());
@@ -450,7 +413,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
       : `<button class="jc-link" type="button" data-action="upvote">Upvote</button>`;
     return `
       <article class="jc-comment" id="comment-${id}" data-id="${id}" data-parent-id="${parentId}" data-reply="${Boolean(comment.parentId)}">
-        ${this.renderComment(comment)}
+        ${renderCommentHtml(comment)}
         <div class="jc-actions">
           ${voteButton}
           <button class="jc-link" type="button" data-action="reply">Reply</button>
@@ -717,3 +680,13 @@ customElements.define("j-comment-section", class extends HTMLElement {
   }
 
 });
+
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
