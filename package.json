@@ -1,0 +1,12 @@
+{
+  "name": "jcomment",
+  "version": "0.1.0",
+  "license": "MPL-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "check": "npm run build && node scripts/check-wasm.mjs && node scripts/check-server.mjs && node scripts/check-cloudflare-d1.mjs && ./scripts/check-cgi.sh",
+    "demo": "npm run build && ./dist/jcomment-demo"
+  }
+}
