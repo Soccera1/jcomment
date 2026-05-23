@@ -74,7 +74,7 @@ fn runCgi(
     try env_map.put("JCOMMENT_DATA_DIR", "dist/.demo-data");
     try env_map.put("JCOMMENT_EMAIL_MODE", "optional");
     try env_map.put("JCOMMENT_PASSWORD_RESET_ENABLED", "1");
-    try env_map.put("JCOMMENT_PASSWORD_RESET_EXPOSE_TOKEN", "1");
+    try env_map.put("JCOMMENT_PASSWORD_RESET_COMMAND", "/bin/true");
     try env_map.put("REQUEST_METHOD", @tagName(request.head.method));
     try env_map.put("PATH_INFO", path);
     try env_map.put("QUERY_STRING", query);

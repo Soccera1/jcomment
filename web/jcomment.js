@@ -342,8 +342,9 @@ customElements.define("j-comment-section", class extends HTMLElement {
     this.thread = this.dataset.thread || location.pathname;
     this.site = this.dataset.site || location.host;
     this.limit = Number(this.dataset.limit || 100);
+    this.replyLimit = Number(this.dataset.replyLimit || 50);
     this.storageKey = `jcomment:${this.thread}:author`;
-    this.tokenKey = `jcomment:${this.site}:token`;
+    this.token = "";
     this.list = this.shadowRoot.querySelector(".jc-list");
     this.count = this.shadowRoot.querySelector(".jc-count");
     this.form = this.shadowRoot.querySelector("form");
@@ -375,6 +376,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
     url.searchParams.set("site", this.site);
     url.searchParams.set("sort", this.sort?.value || "newest");
     url.searchParams.set("limit", String(this.limit));
+    url.searchParams.set("replyLimit", String(this.replyLimit));
     for (const [key, value] of Object.entries(extra)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
@@ -383,7 +385,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
 
   async refresh() {
     try {
-      const response = await fetch(this.apiUrl());
+      const response = await fetch(this.apiUrl(), { credentials: "include" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = normalizePayload(await response.json());
       this.comments = payload.comments;
@@ -478,6 +480,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
     try {
       const response = await fetch(this.apiUrl(), {
         method: "PATCH",
+        credentials: "include",
         headers: this.authHeaders(),
         body: JSON.stringify({ id, action: "upvote" })
       });
@@ -527,13 +530,14 @@ customElements.define("j-comment-section", class extends HTMLElement {
       url.searchParams.set("site", this.site);
       const response = await fetch(url, {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username: name, password })
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
-      localStorage.setItem(this.tokenKey, payload.token);
-      if (!this.authorInput.value) this.authorInput.value = name;
+      this.setToken(payload.token);
+      this.authorInput.value = payload.user?.username || name;
       this.loginPanel.dataset.active = "false";
       this.error.textContent = "";
     } catch (error) {
@@ -558,6 +562,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
       url.searchParams.set("site", this.site);
       const response = await fetch(url, {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username, email, password })
       });
@@ -566,8 +571,8 @@ customElements.define("j-comment-section", class extends HTMLElement {
         throw new Error(payload.error || `HTTP ${response.status}`);
       }
       const payload = await response.json();
-      localStorage.setItem(this.tokenKey, payload.token);
-      if (!this.authorInput.value) this.authorInput.value = username;
+      this.setToken(payload.token);
+      this.authorInput.value = payload.user?.username || username;
       this.loginPanel.dataset.active = "false";
       this.error.textContent = "";
     } catch (error) {
@@ -591,6 +596,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
       url.searchParams.set("site", this.site);
       const response = await fetch(url, {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username, email })
       });
@@ -615,6 +621,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
       url.searchParams.set("site", this.site);
       const response = await fetch(url, {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ token, password })
       });
@@ -636,9 +643,18 @@ customElements.define("j-comment-section", class extends HTMLElement {
 
   authHeaders() {
     const headers = { "content-type": "application/json" };
-    const token = localStorage.getItem(this.tokenKey);
+    const token = this.getToken();
     if (token) headers.authorization = `Bearer ${token}`;
     return headers;
+  }
+
+  getToken() {
+    return this.token || "";
+  }
+
+  setToken(token) {
+    if (!token) return;
+    this.token = token;
   }
 
   async submit(event) {
@@ -652,6 +668,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
     try {
       const response = await fetch(this.apiUrl(), {
         method: "POST",
+        credentials: "include",
         headers: this.authHeaders(),
         body: JSON.stringify({ author, body, parentId: this.parentId })
       });
