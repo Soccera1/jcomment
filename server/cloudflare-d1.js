@@ -20,6 +20,7 @@ export function createD1Store({
       db.prepare("create table if not exists rate_limits (key text primary key, count integer not null, reset_at integer not null)")
     ]);
     await tryMigration(db, "alter table comments add column site text not null default 'default'");
+    await tryMigration(db, "alter table comments add column parent_id text not null default ''");
     await tryMigration(db, "alter table votes add column site text not null default 'default'");
     await db.prepare("create index if not exists comments_site_thread_idx on comments(site, thread, created_at)").run();
     await db.prepare("create unique index if not exists accounts_site_username_key_idx on accounts(site, lower(username))").run();
@@ -40,6 +41,9 @@ export function createD1Store({
     `).run();
     await db.prepare("create unique index if not exists votes_identity_slot_idx on votes(site, thread, comment_id, identity_type, identity_value, vote_slot)").run();
     await db.prepare("update sessions set expires_at = unixepoch() * 1000 + 2592000000 where expires_at = 0").run();
+    await db.prepare("delete from reset_tokens where expires_at < ?").bind(Date.now()).run();
+    await db.prepare("delete from reset_tokens where rowid not in (select max(rowid) from reset_tokens group by account_id, site)").run();
+    await db.prepare("create unique index if not exists reset_tokens_account_site_idx on reset_tokens(account_id, site)").run();
     await cleanupExpiredAuth(db);
     schemaReady = true;
   }
@@ -47,9 +51,9 @@ export function createD1Store({
   async function listThread(site, thread, options = {}) {
     await ensureSchema();
     const sort = normalizeSort(options.sort);
-    const start = Math.max(0, Number(options.cursor) || 0);
-    const size = Math.max(1, Math.min(200, Number(options.limit) || 100));
-    const repliesPerRoot = Math.max(0, Math.min(200, Number(options.replyLimit) || 50));
+    const start = parsePositiveInt(options.cursor, 0, 500);
+    const size = parsePositiveInt(options.limit, 100, 200);
+    const repliesPerRoot = parsePositiveInt(options.replyLimit, 50, 200);
     const rootCountRow = await db.prepare("select count(*) as count from comments where site = ? and thread = ? and parent_id = ''")
       .bind(site, thread)
       .first();
@@ -156,18 +160,16 @@ export function createD1Store({
         .bind(site, thread, id)
         .first();
       if (!comment) throw statusError("Comment was not found", 404);
-      await rememberVote(db, site, thread, id, options.identity, options.maxVotesPerIdentity);
-      await db.prepare("update comments set score = max(-999999, min(999999, score + ?)) where site = ? and thread = ? and id = ?")
-        .bind(delta, site, thread, id)
-        .run();
+      await rememberVoteAndIncrement(db, site, thread, id, delta, options.identity, options.maxVotesPerIdentity);
       return listThread(site, thread, options);
     },
     async signup(site, input, accountConfig) {
       await ensureSchema();
       requireHasher();
-      const username = sanitizeText(input.username || input.name, 80);
+      const username = sanitizeAccountText(input.username || input.name, 80);
       const email = sanitizeEmail(input.email);
 	      const password = String(input.password || "");
+	      if (username === null) throw statusError("Username contains invalid characters", 400);
 	      if (!username) throw statusError("Username is required", 400);
 	      if (isReservedUsername(username, accountConfig)) throw statusError("Username is reserved for this site", 400);
 	      if (password.length < 8) throw statusError("Password must be at least 8 characters", 400);
@@ -202,9 +204,13 @@ export function createD1Store({
     async login(site, input, accountConfig = defaultAccountConfig()) {
       await ensureSchema();
       requireHasher();
-      const username = sanitizeText(input.username || input.name, 80);
+      const username = sanitizeAccountText(input.username || input.name, 80);
       const password = String(input.password || "");
       if (password.length > 256) throw statusError("Invalid username or password", 401);
+      if (username === null) {
+        await hashPassword(password);
+        throw statusError("Invalid username or password", 401);
+      }
       const account = await db.prepare("select id, site, username, email, password_hash as passwordHash, created_at as createdAt from accounts where site = ? and lower(username) = lower(?)")
         .bind(site, username)
         .first();
@@ -222,8 +228,12 @@ export function createD1Store({
       await cleanupExpiredAuth(db);
       if (!accountConfig.passwordReset.enabled) throw statusError("Password reset is disabled for this site", 403);
       if (accountConfig.email.mode === "none") throw statusError("Password reset requires email support", 403);
-      const username = sanitizeText(input.username || input.name, 80);
+      const username = sanitizeAccountText(input.username || input.name, 80);
       const email = sanitizeEmail(input.email);
+      if (username === null) {
+        await resetDummyWork();
+        return { ok: true };
+      }
       const account = await db.prepare("select id, site, username, email from accounts where site = ? and lower(username) = lower(?)")
         .bind(site, username)
         .first();
@@ -240,16 +250,24 @@ export function createD1Store({
 	      }
       const token = crypto.randomUUID();
       const digest = await tokenDigest(token);
-      await db.prepare("insert into reset_tokens (token, account_id, site, expires_at) values (?, ?, ?, ?)")
-        .bind(digest, account.id, site, Date.now() + accountConfig.passwordReset.ttlMs)
-        .run();
+      try {
+        await db.prepare("insert into reset_tokens (token, account_id, site, expires_at) values (?, ?, ?, ?)")
+          .bind(digest, account.id, site, Date.now() + accountConfig.passwordReset.ttlMs)
+          .run();
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          await resetDummyWork();
+          return { ok: true };
+        }
+        throw error;
+      }
       try {
         await accountConfig.passwordReset.onToken?.({ site, username: account.username, email: account.email, token });
       } catch (error) {
         await db.prepare("delete from reset_tokens where token = ? and account_id = ? and site = ?")
           .bind(digest, account.id, site)
           .run();
-        throw error;
+        console.error("jcomment password reset delivery failed");
       }
       return { ok: true };
     },
@@ -272,11 +290,28 @@ export function createD1Store({
         .bind(reset.accountId, site)
         .first();
       if (!account) throw statusError("Invalid or expired reset token", 400);
-      await db.batch([
-        db.prepare("update accounts set password_hash = ? where id = ?").bind(await hashPassword(password), reset.accountId),
-        db.prepare("delete from reset_tokens where account_id = ? and site = ?").bind(reset.accountId, site),
-        db.prepare("delete from sessions where account_id = ? and site = ?").bind(reset.accountId, site)
+      const passwordHash = await hashPassword(password);
+      const now = Date.now();
+      const results = await db.batch([
+        db.prepare(`
+          update accounts set password_hash = ?
+          where id = ? and site = ?
+            and exists (select 1 from reset_tokens where token = ? and account_id = ? and site = ? and expires_at >= ?)
+        `).bind(passwordHash, reset.accountId, site, reset.token, reset.accountId, site, now),
+        db.prepare(`
+          delete from sessions
+          where account_id = ? and site = ?
+            and exists (select 1 from reset_tokens where token = ? and account_id = ? and site = ? and expires_at >= ?)
+        `).bind(reset.accountId, site, reset.token, reset.accountId, site, now),
+        db.prepare(`
+          delete from reset_tokens
+          where account_id = ? and site = ?
+            and exists (select 1 from reset_tokens where token = ? and account_id = ? and site = ? and expires_at >= ?)
+        `).bind(reset.accountId, site, reset.token, reset.accountId, site, now)
       ]);
+      if (Number(results?.[0]?.meta?.changes || 0) !== 1) {
+        throw statusError("Invalid or expired reset token", 400);
+      }
       return { ok: true };
     },
     async identify(token, site) {
@@ -338,8 +373,8 @@ async function enforceCommentQuota(db, site, thread, quotas = {}) {
 
 function normalizeQuotas(quotas = {}) {
   return {
-    maxCommentsPerThread: Math.max(1, Number(quotas.maxCommentsPerThread || 512)),
-    maxCommentsPerSite: Math.max(1, Number(quotas.maxCommentsPerSite || 5000))
+    maxCommentsPerThread: positiveNumber(quotas.maxCommentsPerThread, 512, 1, "quotas.maxCommentsPerThread"),
+    maxCommentsPerSite: positiveNumber(quotas.maxCommentsPerSite, 5000, 1, "quotas.maxCommentsPerSite")
   };
 }
 
@@ -366,13 +401,16 @@ async function createSession(db, account, accountConfig = defaultAccountConfig()
   };
 }
 
-async function rememberVote(db, site, thread, id, identity, maxVotesPerIdentity = 1) {
+async function rememberVoteAndIncrement(db, site, thread, id, delta, identity, maxVotesPerIdentity = 1) {
   if (!identity) throw statusError("Login is required to vote from this network", 401);
   for (let slot = 0; slot < maxVotesPerIdentity; slot += 1) {
     try {
-      await db.prepare("insert into votes (site, thread, comment_id, identity_type, identity_value, vote_slot, label, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(site, thread, id, identity.type, identity.value, slot, identity.label, new Date().toISOString())
-        .run();
+      await db.batch([
+        db.prepare("insert into votes (site, thread, comment_id, identity_type, identity_value, vote_slot, label, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(site, thread, id, identity.type, identity.value, slot, identity.label, new Date().toISOString()),
+        db.prepare("update comments set score = max(-999999, min(999999, score + ?)) where site = ? and thread = ? and id = ?")
+          .bind(delta, site, thread, id)
+      ]);
       return;
     } catch (error) {
       if (!isUniqueConstraintError(error)) throw error;
@@ -382,6 +420,8 @@ async function rememberVote(db, site, thread, id, identity, maxVotesPerIdentity 
 }
 
 function listComments(comments, { sort = "newest", limit = 100, cursor = 0 } = {}) {
+  const start = parsePositiveInt(cursor, 0, 500);
+  const size = parsePositiveInt(limit, 100, 200);
   const byParent = new Map();
   const normalized = comments.map(normalizeComment);
   for (const comment of normalized) {
@@ -398,14 +438,20 @@ function listComments(comments, { sort = "newest", limit = 100, cursor = 0 } = {
     ordered.push(root);
     ordered.push(...(byParent.get(root.id) || []).sort(sorter("oldest")));
   }
-  const start = Math.max(0, Number(cursor) || 0);
-  const size = Math.max(1, Math.min(200, Number(limit) || 100));
   return {
     comments: ordered.slice(start, start + size),
     count: normalized.length,
     nextCursor: start + size < ordered.length ? String(start + size) : null,
     sort
   };
+}
+
+function parsePositiveInt(value, fallback, max = 500) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "string" && !/^[0-9]+$/.test(value)) return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) return fallback;
+  return Math.min(number, max);
 }
 
 function normalizeComment(comment) {
@@ -443,11 +489,36 @@ function sanitizeEmail(value) {
 }
 
 function sanitizeText(value, max) {
-  return String(value || "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").trim().slice(0, max);
+  return String(value || "")
+    .replace(/\p{C}/gu, char => (char === "\n" || char === "\t" ? char : ""))
+    .trim()
+    .slice(0, max);
+}
+
+function sanitizeAccountText(value, max) {
+  const text = String(value || "");
+  if (hasDisallowedAccountCodepoint(text)) return null;
+  return text.trim().slice(0, max);
+}
+
+function hasDisallowedAccountCodepoint(value) {
+  return /[\p{C}\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFFF9-\uFFFB\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u.test(value);
 }
 
 function clampScore(value) {
   return Math.max(-999999, Math.min(999999, Number.isFinite(value) ? Math.trunc(value) : 0));
+}
+
+function positiveNumber(value, fallback, minimum = 1, name = "value") {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "string" && !/^[0-9]+$/.test(value)) {
+    throw new Error(`Invalid jcomment configuration: ${name} must be an integer greater than or equal to ${minimum}`);
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < minimum) {
+    throw new Error(`Invalid jcomment configuration: ${name} must be an integer greater than or equal to ${minimum}`);
+  }
+  return number;
 }
 
 function statusError(message, status) {

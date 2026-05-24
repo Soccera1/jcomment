@@ -11,7 +11,8 @@
     "build:all": "./scripts/build-all.sh",
     "check": "npm run build && node scripts/check-renderer.mjs && node scripts/check-server.mjs && node scripts/check-cloudflare-d1.mjs",
     "check:cgi": "npm run build:cgi && ./scripts/check-cgi.sh",
-    "check:all": "npm run check && npm run check:cgi",
+    "check:demo": "npm run build:all && ./scripts/check-demo.sh",
+    "check:all": "npm run check && npm run check:cgi && npm run check:demo",
     "demo": "npm run build:all && ./dist/jcomment-demo"
   }
 }

@@ -345,6 +345,7 @@ customElements.define("j-comment-section", class extends HTMLElement {
     this.replyLimit = Number(this.dataset.replyLimit || 50);
     this.storageKey = `jcomment:${this.thread}:author`;
     this.token = "";
+    this.tokenOrigin = "";
     this.list = this.shadowRoot.querySelector(".jc-list");
     this.count = this.shadowRoot.querySelector(".jc-count");
     this.form = this.shadowRoot.querySelector("form");
@@ -478,13 +479,15 @@ customElements.define("j-comment-section", class extends HTMLElement {
   async vote(id, button) {
     button.disabled = true;
     try {
-      const response = await fetch(this.apiUrl(), {
+      const url = this.apiUrl();
+      const response = await fetch(url, {
         method: "PATCH",
         credentials: "include",
-        headers: this.authHeaders(),
+        headers: this.authHeaders(url),
         body: JSON.stringify({ id, action: "upvote" })
       });
       if (response.status === 401) {
+        this.clearToken();
         if (this.capabilities.login === false) {
           this.error.textContent = "Voting requires an identity, but login is disabled for this site.";
         } else {
@@ -536,12 +539,14 @@ customElements.define("j-comment-section", class extends HTMLElement {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
-      this.setToken(payload.token);
+      this.setToken(payload.token, url);
       this.authorInput.value = payload.user?.username || name;
       this.loginPanel.dataset.active = "false";
       this.error.textContent = "";
     } catch (error) {
       this.error.textContent = `Could not sign in: ${error.message}`;
+    } finally {
+      this.clearSecretFields();
     }
   }
 
@@ -571,12 +576,15 @@ customElements.define("j-comment-section", class extends HTMLElement {
         throw new Error(payload.error || `HTTP ${response.status}`);
       }
       const payload = await response.json();
-      this.setToken(payload.token);
+      this.setToken(payload.token, url);
       this.authorInput.value = payload.user?.username || username;
       this.loginPanel.dataset.active = "false";
       this.error.textContent = "";
     } catch (error) {
       this.error.textContent = `Could not create account: ${error.message}`;
+    } finally {
+      this.clearSecretFields();
+      this.clearContactFields();
     }
   }
 
@@ -601,8 +609,8 @@ customElements.define("j-comment-section", class extends HTMLElement {
         body: JSON.stringify({ username, email })
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = await response.json();
-      if (payload.token) this.resetTokenInput.value = payload.token;
+      await response.json();
+      this.clearContactFields();
       this.error.textContent = "If the account exists, a reset token has been issued.";
     } catch (error) {
       this.error.textContent = `Could not request reset: ${error.message}`;
@@ -626,9 +634,12 @@ customElements.define("j-comment-section", class extends HTMLElement {
         body: JSON.stringify({ token, password })
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      this.clearToken();
       this.error.textContent = "Password updated. You can sign in now.";
     } catch (error) {
       this.error.textContent = `Could not reset password: ${error.message}`;
+    } finally {
+      this.clearSecretFields();
     }
   }
 
@@ -641,10 +652,12 @@ customElements.define("j-comment-section", class extends HTMLElement {
     this.loginInput.focus();
   }
 
-  authHeaders() {
+  authHeaders(targetUrl = location.href) {
     const headers = { "content-type": "application/json" };
     const token = this.getToken();
-    if (token) headers.authorization = `Bearer ${token}`;
+    if (token && this.tokenOrigin && new URL(targetUrl, location.href).origin === this.tokenOrigin) {
+      headers.authorization = `Bearer ${token}`;
+    }
     return headers;
   }
 
@@ -652,9 +665,22 @@ customElements.define("j-comment-section", class extends HTMLElement {
     return this.token || "";
   }
 
-  setToken(token) {
-    if (!token) return;
-    this.token = token;
+  setToken(token, sourceUrl = location.href) {
+    this.token = token || "";
+    this.tokenOrigin = token ? new URL(sourceUrl, location.href).origin : "";
+  }
+
+  clearSecretFields() {
+    this.loginPasswordInput.value = "";
+    this.resetTokenInput.value = "";
+  }
+
+  clearContactFields() {
+    this.loginEmailInput.value = "";
+  }
+
+  clearToken() {
+    this.setToken("");
   }
 
   async submit(event) {
@@ -666,13 +692,15 @@ customElements.define("j-comment-section", class extends HTMLElement {
     this.button.disabled = true;
     this.error.textContent = "";
     try {
-      const response = await fetch(this.apiUrl(), {
+      const url = this.apiUrl();
+      const response = await fetch(url, {
         method: "POST",
         credentials: "include",
-        headers: this.authHeaders(),
+        headers: this.authHeaders(url),
         body: JSON.stringify({ author, body, parentId: this.parentId })
       });
       if (response.status === 401) {
+        this.clearToken();
         this.showLogin("Sign in to post comments.");
         return;
       }

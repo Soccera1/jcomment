@@ -12,6 +12,7 @@ const max_token = 200;
 const max_thread = 120;
 const max_site = 120;
 const max_sort = 16;
+const max_env_value = 8192;
 const schema_marker = ".jcomment-schema-v2";
 
 const Comment = struct {
@@ -24,6 +25,15 @@ const Comment = struct {
 };
 
 pub fn main() !void {
+    mainImpl() catch |err| switch (err) {
+        error.RequestMetadataTooLarge => try jsonError(400, "Bad Request", "Request metadata is too large"),
+        error.SqliteFailed => try jsonError(500, "Internal Server Error", "Storage operation failed"),
+        error.InvalidSqliteBinary => try jsonError(500, "Internal Server Error", "JCOMMENT_SQLITE_BIN must be an absolute executable path"),
+        else => return err,
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31,6 +41,14 @@ pub fn main() !void {
     ensureDataDir(allocator) catch |err| switch (err) {
         error.MissingRequiredEnvironment => {
             try jsonError(500, "Internal Server Error", "JCOMMENT_DATA_DIR is required");
+            return;
+        },
+        error.UnsafeDataDir => {
+            try jsonError(500, "Internal Server Error", "JCOMMENT_DATA_DIR must be a private directory and must not be a symlink");
+            return;
+        },
+        error.InvalidSqliteBinary => {
+            try jsonError(500, "Internal Server Error", "JCOMMENT_SQLITE_BIN must be an absolute executable path");
             return;
         },
         else => return err,
@@ -45,16 +63,20 @@ pub fn main() !void {
 
     const thread_owned = try queryParam(allocator, query, "thread", "default");
     defer allocator.free(thread_owned);
-    const thread = thread_owned[0..@min(thread_owned.len, max_thread)];
-    sanitizeThread(thread);
+    const thread = try cleanAllocLimit(allocator, thread_owned, "default", max_thread);
+    defer allocator.free(thread);
 
     const configured_site_owned = try envOr(allocator, "JCOMMENT_SITE", "");
     defer allocator.free(configured_site_owned);
-    const configured_site = configured_site_owned[0..@min(configured_site_owned.len, max_site)];
     const server_name_owned = try envOr(allocator, "SERVER_NAME", "default");
     defer allocator.free(server_name_owned);
-    const server_name = server_name_owned[0..@min(server_name_owned.len, max_site)];
-    const site = try allocator.dupe(u8, if (configured_site.len > 0) configured_site else server_name);
+    const site = siteName(allocator, configured_site_owned, server_name_owned) catch |err| switch (err) {
+        error.InvalidSiteName => {
+            try jsonError(500, "Internal Server Error", "JCOMMENT_SITE and SERVER_NAME must not contain control characters, surrounding whitespace, or exceed 120 bytes");
+            return;
+        },
+        else => return err,
+    };
     defer allocator.free(site);
     const sort_owned = try queryParam(allocator, query, "sort", "newest");
     defer allocator.free(sort_owned);
@@ -62,12 +84,29 @@ pub fn main() !void {
 
     if (!try validateConfig(allocator)) return;
 
+    if (!isKnownApiPath(path)) {
+        try jsonError(404, "Not Found", "Not found");
+        return;
+    }
+    if (!try publicOriginMatchesRequest(allocator)) {
+        try jsonError(400, "Bad Request", "Bad Request");
+        return;
+    }
+
     if (std.mem.eql(u8, method, "OPTIONS")) {
         try status(204, "No Content");
         return;
     }
     if (std.mem.eql(u8, method, "GET")) {
+        if (!isCommentPath(path)) {
+            try jsonError(405, "Method Not Allowed", "Method not allowed");
+            return;
+        }
         try listResponse(allocator, site, thread, sort);
+        return;
+    }
+    if (!methodAllowsBody(method, path)) {
+        try jsonError(405, "Method Not Allowed", "Method not allowed");
         return;
     }
     if (!try validateUnsafeRequest(allocator, method)) return;
@@ -80,40 +119,76 @@ pub fn main() !void {
             try jsonError(413, "Payload Too Large", "Request body is too large");
             return;
         },
+        error.InvalidRequestBody => {
+            try jsonError(400, "Bad Request", "Invalid request body");
+            return;
+        },
         else => return err,
     };
     defer allocator.free(body);
 
-    if (std.mem.eql(u8, method, "POST") and std.mem.endsWith(u8, path, "/signup")) {
+    if (std.mem.eql(u8, method, "POST") and isSignupPath(path)) {
         if (!try rateLimit(allocator, "signup", site, request_ip, 5)) return;
         if (!envEnabled(allocator, "JCOMMENT_LOGIN_ENABLED", true)) {
             try jsonError(403, "Forbidden", "Login is disabled for this site");
             return;
         }
         try handleJsonError(handleSignup(allocator, site, body));
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.endsWith(u8, path, "/login")) {
+    } else if (std.mem.eql(u8, method, "POST") and isLoginPath(path)) {
         if (!try rateLimit(allocator, "login", site, request_ip, 10)) return;
         if (!envEnabled(allocator, "JCOMMENT_LOGIN_ENABLED", true)) {
             try jsonError(403, "Forbidden", "Login is disabled for this site");
             return;
         }
         try handleJsonError(handleLogin(allocator, site, body));
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.endsWith(u8, path, "/reset/request")) {
+    } else if (std.mem.eql(u8, method, "POST") and isResetRequestPath(path)) {
         if (!try rateLimit(allocator, "reset", site, request_ip, 3)) return;
         try handleJsonError(handleResetRequest(allocator, site, body));
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.endsWith(u8, path, "/reset/confirm")) {
+    } else if (std.mem.eql(u8, method, "POST") and isResetConfirmPath(path)) {
         if (!try rateLimit(allocator, "reset", site, request_ip, 3)) return;
         try handleJsonError(handleResetConfirm(allocator, site, body));
-    } else if (std.mem.eql(u8, method, "POST")) {
+    } else if (std.mem.eql(u8, method, "POST") and isCommentPath(path)) {
         if (!try rateLimit(allocator, "post", site, request_ip, 20)) return;
         if (!try rateLimit(allocator, "post-site", site, request_ip, 60)) return;
         try handleJsonError(handleAdd(allocator, thread, site, sort, body));
-    } else if (std.mem.eql(u8, method, "PATCH")) {
+    } else if (std.mem.eql(u8, method, "PATCH") and isCommentPath(path)) {
         if (!try rateLimit(allocator, "vote", site, request_ip, 60)) return;
         try handleJsonError(handleVote(allocator, thread, site, sort, body));
     } else {
         try jsonError(405, "Method Not Allowed", "Method not allowed");
     }
+}
+
+fn isKnownApiPath(path: []const u8) bool {
+    return isCommentPath(path) or isSignupPath(path) or isLoginPath(path) or isResetRequestPath(path) or isResetConfirmPath(path);
+}
+
+fn isCommentPath(path: []const u8) bool {
+    return path.len == 0 or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/api/comments");
+}
+
+fn isSignupPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/signup") or std.mem.eql(u8, path, "/api/comments/signup");
+}
+
+fn isLoginPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/login") or std.mem.eql(u8, path, "/api/comments/login");
+}
+
+fn isResetRequestPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/reset/request") or std.mem.eql(u8, path, "/api/comments/reset/request");
+}
+
+fn isResetConfirmPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/reset/confirm") or std.mem.eql(u8, path, "/api/comments/reset/confirm");
+}
+
+fn methodAllowsBody(method: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, method, "POST")) {
+        return isCommentPath(path) or isSignupPath(path) or isLoginPath(path) or isResetRequestPath(path) or isResetConfirmPath(path);
+    }
+    if (std.mem.eql(u8, method, "PATCH")) return isCommentPath(path);
+    return false;
 }
 
 fn stdout() std.fs.File.Writer {
@@ -128,34 +203,68 @@ fn statusWithCookie(code: u16, message: []const u8, set_cookie: ?[]const u8) !vo
     const w = stdout();
     try w.print("Status: {d} {s}\r\n", .{ code, message });
     try w.writeAll("Content-Type: application/json; charset=utf-8\r\n");
+    try w.writeAll("Cache-Control: no-store\r\n");
+    try w.writeAll("Pragma: no-cache\r\n");
+    try w.writeAll("X-Content-Type-Options: nosniff\r\n");
     if (set_cookie) |cookie| {
         try w.print("Set-Cookie: {s}\r\n", .{cookie});
     }
-    const origin = std.process.getEnvVarOwned(std.heap.page_allocator, "JCOMMENT_CORS_ORIGIN") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
+    const origin = envOr(std.heap.page_allocator, "JCOMMENT_CORS_ORIGIN", "") catch null;
     if (origin) |value| {
         defer std.heap.page_allocator.free(value);
         if (value.len > 0) {
-            if (!validCorsOrigin(value)) return error.InvalidCorsOrigin;
-            try w.print("Access-Control-Allow-Origin: {s}\r\n", .{value});
-            try w.writeAll("Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n");
-            try w.writeAll("Access-Control-Allow-Headers: authorization, content-type\r\n");
-            if (!std.mem.eql(u8, value, "*")) {
-                try w.writeAll("Access-Control-Allow-Credentials: true\r\n");
+            if (validCorsHeaderOrigin(std.heap.page_allocator, value)) {
+                try w.print("Access-Control-Allow-Origin: {s}\r\n", .{value});
+                try w.writeAll("Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n");
+                try w.writeAll("Access-Control-Allow-Headers: authorization, content-type\r\n");
+                if (!std.mem.eql(u8, value, "*")) {
+                    try w.writeAll("Access-Control-Allow-Credentials: true\r\n");
+                }
             }
         }
     }
     try w.writeAll("\r\n");
 }
 
+fn validCorsHeaderOrigin(allocator: std.mem.Allocator, value: []const u8) bool {
+    if (!validCorsOrigin(value)) return false;
+    if (!std.mem.eql(u8, value, "*")) return true;
+    const raw_cookie_enabled = envOr(allocator, "JCOMMENT_SESSION_COOKIE_ENABLED", "") catch return false;
+    defer allocator.free(raw_cookie_enabled);
+    if (raw_cookie_enabled.len == 0) return true;
+    const cookie_enabled = boolEnvValue(raw_cookie_enabled) orelse return false;
+    return !cookie_enabled;
+}
+
 fn validCorsOrigin(value: []const u8) bool {
     if (std.mem.eql(u8, value, "*")) return true;
-    if (std.mem.indexOfAny(u8, value, "\r\n") != null) return false;
-    if (!(std.mem.startsWith(u8, value, "https://") or std.mem.startsWith(u8, value, "http://"))) return false;
+    if (std.mem.indexOfScalar(u8, value, ' ') != null) return false;
+    for (value) |c| {
+        if (c < 32 or c == 127) return false;
+    }
+    const is_https = std.mem.startsWith(u8, value, "https://");
+    const is_http = std.mem.startsWith(u8, value, "http://");
+    const authority = if (is_https)
+        value["https://".len..]
+    else if (is_http)
+        value["http://".len..]
+    else
+        return false;
+    if (authority.len == 0 or std.mem.indexOfAny(u8, authority, "/?#") != null or std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    for (authority) |c| {
+        if (std.ascii.isUpper(c)) return false;
+    }
+    if ((is_https and std.mem.endsWith(u8, authority, ":443")) or
+        (is_http and std.mem.endsWith(u8, authority, ":80")))
+    {
+        return false;
+    }
     _ = std.Uri.parse(value) catch return false;
     return true;
+}
+
+fn validRequestOrigin(value: []const u8) bool {
+    return !std.mem.eql(u8, value, "*") and validCorsOrigin(value);
 }
 
 fn jsonError(code: u16, message: []const u8, err: []const u8) !void {
@@ -174,17 +283,83 @@ fn handleJsonError(result: anyerror!void) !void {
 }
 
 fn envOr(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+    const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, fallback),
-        else => err,
+        else => return err,
     };
+    errdefer allocator.free(value);
+    if (value.len > max_env_value) return error.RequestMetadataTooLarge;
+    return value;
 }
 
 fn envEnabled(allocator: std.mem.Allocator, key: []const u8, fallback: bool) bool {
     const value = envOr(allocator, key, "") catch return fallback;
     defer allocator.free(value);
     if (value.len == 0) return fallback;
-    return !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "off"));
+    return boolEnvValue(value) orelse fallback;
+}
+
+fn boolEnvValue(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "yes")) return true;
+    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "no")) return false;
+    return null;
+}
+
+fn plainDecimalDigits(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn validateBoolEnv(allocator: std.mem.Allocator, writer: anytype, key: []const u8, has_error: *bool) !void {
+    const value = try envOr(allocator, key, "");
+    defer allocator.free(value);
+    if (value.len > 0 and boolEnvValue(value) == null) {
+        try writer.print("{s} must be 1, true, on, yes, 0, false, off, or no; ", .{key});
+        has_error.* = true;
+    }
+}
+
+fn validatePositiveIntEnv(allocator: std.mem.Allocator, writer: anytype, key: []const u8, has_error: *bool) !void {
+    const value = try envOr(allocator, key, "");
+    defer allocator.free(value);
+    if (value.len == 0) return;
+    if (!plainDecimalDigits(value)) {
+        try writer.print("{s} must be a positive integer; ", .{key});
+        has_error.* = true;
+        return;
+    }
+    const parsed = std.fmt.parseInt(i64, value, 10) catch {
+        try writer.print("{s} must be a positive integer; ", .{key});
+        has_error.* = true;
+        return;
+    };
+    if (parsed < 1) {
+        try writer.print("{s} must be a positive integer; ", .{key});
+        has_error.* = true;
+    }
+}
+
+fn validProxyHeaderName(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "cf-connecting-ip") or
+        std.ascii.eqlIgnoreCase(value, "x-real-ip") or
+        std.ascii.eqlIgnoreCase(value, "x-forwarded-for");
+}
+
+fn validEmailMode(value: []const u8) bool {
+    return std.mem.eql(u8, value, "none") or std.mem.eql(u8, value, "optional") or std.mem.eql(u8, value, "required");
+}
+
+fn validCookieSameSite(value: []const u8) bool {
+    return std.mem.eql(u8, value, "Strict") or std.mem.eql(u8, value, "Lax") or std.mem.eql(u8, value, "None");
+}
+
+fn brokenConfigEnabled(allocator: std.mem.Allocator) bool {
+    const value = envOr(allocator, "BROKEN_CONFIG", "") catch return false;
+    defer allocator.free(value);
+    return boolEnvValue(value) orelse false;
 }
 
 fn validateConfig(allocator: std.mem.Allocator) !bool {
@@ -193,13 +368,85 @@ fn validateConfig(allocator: std.mem.Allocator) !bool {
     const reset_enabled = envEnabled(allocator, "JCOMMENT_PASSWORD_RESET_ENABLED", false);
     const cookie_enabled = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_ENABLED", false);
     const expose_token = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_EXPOSE_TOKEN", false);
-    const mode = emailMode(allocator);
+    const cookie_secure = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_SECURE", true);
+    const mode = try emailMode(allocator);
     defer allocator.free(mode);
 
     var errors = std.ArrayList(u8).init(allocator);
     defer errors.deinit();
     const w = errors.writer();
     var has_error = false;
+    try validateBoolEnv(allocator, w, "JCOMMENT_LOGIN_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_REQUIRE_LOGIN_TO_POST", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_PASSWORD_RESET_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_SESSION_COOKIE_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_SESSION_COOKIE_EXPOSE_TOKEN", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_SESSION_COOKIE_SECURE", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_RATE_LIMIT_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_RATE_LIMIT_ALLOW_ANONYMOUS_IDENTITY", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_TRUST_PROXY_HEADERS", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_LOCALHOST_VOTING_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_VOTING_ENABLED", &has_error);
+    try validateBoolEnv(allocator, w, "JCOMMENT_DISCLOSE_ACCOUNT_EXISTENCE", &has_error);
+    try validateBoolEnv(allocator, w, "BROKEN_CONFIG", &has_error);
+    const cors_origin = try envOr(allocator, "JCOMMENT_CORS_ORIGIN", "");
+    defer allocator.free(cors_origin);
+    if (cors_origin.len > 0 and !validCorsOrigin(cors_origin)) {
+        try w.writeAll("JCOMMENT_CORS_ORIGIN must be * or an absolute http(s) origin; ");
+        has_error = true;
+    }
+    if (cookie_enabled and std.mem.eql(u8, cors_origin, "*")) {
+        try w.writeAll("JCOMMENT_CORS_ORIGIN=* requires JCOMMENT_SESSION_COOKIE_ENABLED=0; ");
+        has_error = true;
+    }
+    const public_origin = try envOr(allocator, "JCOMMENT_PUBLIC_ORIGIN", "");
+    defer allocator.free(public_origin);
+    if (public_origin.len > 0 and !validRequestOrigin(public_origin)) {
+        try w.writeAll("JCOMMENT_PUBLIC_ORIGIN must be an absolute http(s) origin; ");
+        has_error = true;
+    }
+    const configured_site = try envOr(allocator, "JCOMMENT_SITE", "");
+    defer allocator.free(configured_site);
+    if (cookie_enabled and configured_site.len > 0 and public_origin.len == 0) {
+        try w.writeAll("JCOMMENT_PUBLIC_ORIGIN is required when JCOMMENT_SITE is set and cookie sessions are enabled; ");
+        has_error = true;
+    }
+    if (!validEmailMode(mode)) {
+        try w.writeAll("JCOMMENT_EMAIL_MODE must be none, optional, or required; ");
+        has_error = true;
+    }
+    const reserved_usernames = try envOr(allocator, "JCOMMENT_RESERVED_USERNAMES", "admin,administrator,moderator,mod,staff,system,anonymous,jcomment");
+    defer allocator.free(reserved_usernames);
+    if (!try validReservedUsernames(allocator, reserved_usernames)) {
+        try w.writeAll("JCOMMENT_RESERVED_USERNAMES must contain non-empty account names without control, invisible, or variation-selector characters; ");
+        has_error = true;
+    }
+    const cookie_name = try envOr(allocator, "JCOMMENT_SESSION_COOKIE_NAME", "jcomment_session");
+    defer allocator.free(cookie_name);
+    if (!validCookieName(cookie_name)) {
+        try w.writeAll("JCOMMENT_SESSION_COOKIE_NAME must be a valid cookie name; ");
+        has_error = true;
+    }
+    const cookie_same_site = try envOr(allocator, "JCOMMENT_SESSION_COOKIE_SAMESITE", "Lax");
+    defer allocator.free(cookie_same_site);
+    if (!validCookieSameSite(cookie_same_site)) {
+        try w.writeAll("JCOMMENT_SESSION_COOKIE_SAMESITE must be Strict, Lax, or None; ");
+        has_error = true;
+    }
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_SESSION_TTL_MS", &has_error);
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_PASSWORD_RESET_TTL_MS", &has_error);
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_RATE_LIMIT_WINDOW_MS", &has_error);
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_MAX_VOTES_PER_IDENTITY", &has_error);
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_MAX_COMMENTS_PER_THREAD", &has_error);
+    try validatePositiveIntEnv(allocator, w, "JCOMMENT_MAX_COMMENTS_PER_SITE", &has_error);
+    if (envEnabled(allocator, "JCOMMENT_TRUST_PROXY_HEADERS", false)) {
+        const proxy_header = try envOr(allocator, "JCOMMENT_TRUST_PROXY_HEADER", "");
+        defer allocator.free(proxy_header);
+        if (!validProxyHeaderName(proxy_header)) {
+            try w.writeAll("JCOMMENT_TRUST_PROXY_HEADER must be cf-connecting-ip, x-real-ip, or x-forwarded-for when JCOMMENT_TRUST_PROXY_HEADERS is enabled; ");
+            has_error = true;
+        }
+    }
     if (require_login_to_post and !login_enabled) {
         try w.writeAll("JCOMMENT_REQUIRE_LOGIN_TO_POST requires JCOMMENT_LOGIN_ENABLED; ");
         has_error = true;
@@ -214,15 +461,26 @@ fn validateConfig(allocator: std.mem.Allocator) !bool {
         if (command.len == 0) {
             try w.writeAll("JCOMMENT_PASSWORD_RESET_ENABLED requires JCOMMENT_PASSWORD_RESET_COMMAND; ");
             has_error = true;
+        } else if (!validExecutableAbsolutePath(command)) {
+            try w.writeAll("JCOMMENT_PASSWORD_RESET_COMMAND must be an absolute executable path; ");
+            has_error = true;
         }
     }
     if (cookie_enabled and expose_token) {
         try w.writeAll("JCOMMENT_SESSION_COOKIE_EXPOSE_TOKEN is not supported when JCOMMENT_SESSION_COOKIE_ENABLED is set; ");
         has_error = true;
     }
+    if (cookie_enabled and !cookie_secure) {
+        const same_site = try envOr(allocator, "JCOMMENT_SESSION_COOKIE_SAMESITE", "Lax");
+        defer allocator.free(same_site);
+        if (std.mem.eql(u8, same_site, "None")) {
+            try w.writeAll("JCOMMENT_SESSION_COOKIE_SAMESITE=None requires JCOMMENT_SESSION_COOKIE_SECURE=1; ");
+            has_error = true;
+        }
+    }
     if (!has_error) return true;
 
-    if (envEnabled(allocator, "BROKEN_CONFIG", false)) {
+    if (brokenConfigEnabled(allocator)) {
         std.debug.print("Invalid jcomment configuration: {s}BROKEN_CONFIG=1 is unsupported and may break any number of things.\n", .{errors.items});
         return true;
     }
@@ -248,11 +506,15 @@ fn validateUnsafeRequest(allocator: std.mem.Allocator, method: []const u8) !bool
     }
     const origin = try envOr(allocator, "HTTP_ORIGIN", "");
     defer allocator.free(origin);
-    if (origin.len == 0 and fetch_site.len == 0 and try hasSessionCookie(allocator)) {
-        try jsonError(403, "Forbidden", "Cookie-authenticated state-changing requests require browser origin metadata");
+    if (origin.len == 0 and try hasSessionCookie(allocator) and !std.mem.eql(u8, fetch_site, "same-origin")) {
+        try jsonError(403, "Forbidden", "Cookie-authenticated state-changing requests require same-origin browser metadata");
         return false;
     }
     if (origin.len == 0) return true;
+    if (!validRequestOrigin(origin)) {
+        try jsonError(403, "Forbidden", "Request origin is not allowed");
+        return false;
+    }
     if (try originAllowed(allocator, origin)) return true;
     try jsonError(403, "Forbidden", "Request origin is not allowed");
     return false;
@@ -267,25 +529,38 @@ fn originAllowed(allocator: std.mem.Allocator, origin: []const u8) !bool {
     const cors_origin = try envOr(allocator, "JCOMMENT_CORS_ORIGIN", "");
     defer allocator.free(cors_origin);
     if (cors_origin.len > 0 and !std.mem.eql(u8, cors_origin, "*") and std.mem.eql(u8, origin, cors_origin)) return true;
+    const public_origin = try envOr(allocator, "JCOMMENT_PUBLIC_ORIGIN", "");
+    defer allocator.free(public_origin);
+    if (public_origin.len > 0) return std.mem.eql(u8, origin, public_origin);
     const same_origin = try requestOrigin(allocator);
     defer allocator.free(same_origin);
     return same_origin.len > 0 and std.mem.eql(u8, origin, same_origin);
 }
 
+fn publicOriginMatchesRequest(allocator: std.mem.Allocator) !bool {
+    const public_origin = try envOr(allocator, "JCOMMENT_PUBLIC_ORIGIN", "");
+    defer allocator.free(public_origin);
+    if (public_origin.len == 0) return true;
+    if (!validRequestOrigin(public_origin)) return true;
+    const same_origin = try requestOrigin(allocator);
+    defer allocator.free(same_origin);
+    return std.mem.eql(u8, public_origin, same_origin);
+}
+
 fn requestOrigin(allocator: std.mem.Allocator) ![]u8 {
-    const host = try envOr(allocator, "HTTP_HOST", "");
-    defer allocator.free(host);
-    const name = if (host.len > 0) host else blk: {
-        const server_name = try envOr(allocator, "SERVER_NAME", "");
-        break :blk server_name;
-    };
-    defer if (host.len == 0) allocator.free(name);
+    const name = try envOr(allocator, "SERVER_NAME", "");
+    defer allocator.free(name);
     if (name.len == 0) return allocator.dupe(u8, "");
     const scheme_env = try envOr(allocator, "REQUEST_SCHEME", "");
     defer allocator.free(scheme_env);
     const https = try envOr(allocator, "HTTPS", "");
     defer allocator.free(https);
-    const scheme = if (scheme_env.len > 0) scheme_env else if (std.ascii.eqlIgnoreCase(https, "on") or std.mem.eql(u8, https, "1")) "https" else "http";
+    const scheme = if (std.mem.eql(u8, scheme_env, "http") or std.mem.eql(u8, scheme_env, "https"))
+        scheme_env
+    else if (std.ascii.eqlIgnoreCase(https, "on") or std.mem.eql(u8, https, "1"))
+        "https"
+    else
+        "http";
     return std.fmt.allocPrint(allocator, "{s}://{s}", .{ scheme, name });
 }
 
@@ -322,23 +597,27 @@ fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return allocator.realloc(out, n);
 }
 
-fn sanitizeThread(thread: []u8) void {
-    for (thread) |*c| {
-        if (!(std.ascii.isAlphanumeric(c.*) or c.* == '-' or c.* == '_')) c.* = '_';
-    }
-}
-
-
 fn ensureDataDir(allocator: std.mem.Allocator) !void {
     const dir = try requiredEnv(allocator, "JCOMMENT_DATA_DIR");
     defer allocator.free(dir);
-    try std.fs.cwd().makePath(dir);
-    if (std.fs.cwd().openDir(dir, .{ .iterate = true })) |data_dir| {
-        var mutable_dir = data_dir;
-        defer mutable_dir.close();
-        mutable_dir.chmod(0o700) catch {};
-    } else |_| {}
-    if (try schemaReady(allocator, dir)) return;
+    try rejectSymlinkPathComponents(allocator, dir);
+    var created = false;
+    var data_dir = std.fs.cwd().openDir(dir, .{ .iterate = true, .no_follow = true }) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            try std.fs.cwd().makePath(dir);
+            created = true;
+            break :blk std.fs.cwd().openDir(dir, .{ .iterate = true, .no_follow = true }) catch return error.UnsafeDataDir;
+        },
+        else => return error.UnsafeDataDir,
+    };
+    defer data_dir.close();
+    if (created) {
+        try data_dir.chmod(0o700);
+    } else {
+        const stat = try data_dir.stat();
+        if (stat.mode & 0o077 != 0) return error.UnsafeDataDir;
+    }
+    try rejectUnsafeDataFiles(&data_dir);
     try sqliteExec(allocator,
         \\create table if not exists comments(id text primary key, site text not null default 'default', thread text not null, parent_id text not null, author text not null, body text not null, created_at text not null, score integer not null default 0);
         \\create index if not exists comments_thread_idx on comments(thread, created_at);
@@ -350,6 +629,7 @@ fn ensureDataDir(allocator: std.mem.Allocator) !void {
         \\create table if not exists rate_limits(key text primary key, count integer not null, reset_at integer not null);
     );
     sqliteExecIgnoreError(allocator, "alter table comments add column site text not null default 'default';") catch {};
+    sqliteExecIgnoreError(allocator, "alter table comments add column parent_id text not null default '';") catch {};
     sqliteExecIgnoreError(allocator, "alter table votes add column site text not null default 'default';") catch {};
     sqliteExecIgnoreError(allocator, "alter table votes add column vote_slot integer not null default 0;") catch {};
     sqliteExecIgnoreError(allocator, "alter table sessions add column expires_at integer not null default 0;") catch {};
@@ -372,7 +652,47 @@ fn ensureDataDir(allocator: std.mem.Allocator) !void {
     try sqliteExec(allocator, "update sessions set expires_at = (strftime('%s','now') * 1000) + 2592000000 where expires_at = 0;");
     try sqliteExec(allocator, "update resets set expires_at = (strftime('%s','now') * 1000) + 3600000 where expires_at = 0;");
     try cleanupExpiredAuth(allocator);
+    try sqliteExec(allocator, "delete from resets where rowid not in (select max(rowid) from resets group by site, username);");
+    try sqliteExec(allocator, "create unique index if not exists resets_site_username_idx on resets(site, username);");
     try writeSchemaMarker(allocator, dir);
+}
+
+fn rejectSymlinkPathComponents(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (path.len == 0) return error.UnsafeDataDir;
+    var current = std.ArrayList(u8).init(allocator);
+    defer current.deinit();
+
+    var start: usize = 0;
+    if (std.fs.path.isAbsolute(path)) {
+        try current.append(std.fs.path.sep);
+        while (start < path.len and path[start] == std.fs.path.sep) : (start += 1) {}
+    }
+
+    var parts = std.mem.splitScalar(u8, path[start..], std.fs.path.sep);
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) return error.UnsafeDataDir;
+        if (current.items.len > 0 and current.items[current.items.len - 1] != std.fs.path.sep) {
+            try current.append(std.fs.path.sep);
+        }
+        try current.appendSlice(part);
+        const stat = std.posix.fstatat(std.fs.cwd().fd, current.items, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return error.UnsafeDataDir,
+        };
+        if ((stat.mode & std.posix.S.IFMT) == std.posix.S.IFLNK) return error.UnsafeDataDir;
+    }
+}
+
+fn rejectUnsafeDataFiles(data_dir: *std.fs.Dir) !void {
+    const names = [_][]const u8{ "jcomment.sqlite3", "jcomment.sqlite3-journal", "jcomment.sqlite3-wal", "jcomment.sqlite3-shm", schema_marker };
+    for (names) |name| {
+        const stat = std.posix.fstatat(data_dir.fd, name, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return error.UnsafeDataDir,
+        };
+        if ((stat.mode & std.posix.S.IFMT) == std.posix.S.IFLNK) return error.UnsafeDataDir;
+    }
 }
 
 fn schemaReady(allocator: std.mem.Allocator, dir: []const u8) !bool {
@@ -417,11 +737,19 @@ fn cleanupExpiredAuth(allocator: std.mem.Allocator) !void {
 
 fn sqliteBin(allocator: std.mem.Allocator) ![]u8 {
     const bin = try envOr(allocator, "JCOMMENT_SQLITE_BIN", "/usr/bin/sqlite3");
-    if (bin.len == 0 or bin[0] != '/') {
+    if (!validExecutableAbsolutePath(bin)) {
         allocator.free(bin);
         return error.InvalidSqliteBinary;
     }
     return bin;
+}
+
+fn validExecutableAbsolutePath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/') return false;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    const stat = file.stat() catch return false;
+    return stat.kind == .file and stat.mode & 0o111 != 0;
 }
 
 fn sqliteExec(allocator: std.mem.Allocator, sql: []const u8) !void {
@@ -433,12 +761,12 @@ fn sqliteExec(allocator: std.mem.Allocator, sql: []const u8) !void {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Pipe;
-    try child.spawn();
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 64 * 1024);
+    child.spawn() catch return error.SqliteFailed;
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch return error.SqliteFailed;
     defer allocator.free(stderr);
-    const term = try child.wait();
+    const term = child.wait() catch return error.SqliteFailed;
     if (term.Exited != 0) {
-        std.debug.print("sqlite error: {s}\n", .{stderr});
+        std.debug.print("sqlite command failed\n", .{});
         return error.SqliteFailed;
     }
 }
@@ -452,8 +780,8 @@ fn sqliteExecIgnoreError(allocator: std.mem.Allocator, sql: []const u8) !void {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = try child.wait();
+    child.spawn() catch return error.SqliteFailed;
+    _ = child.wait() catch return error.SqliteFailed;
 }
 
 fn sqliteQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
@@ -465,14 +793,14 @@ fn sqliteQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
-    try child.spawn();
-    const out = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
+    child.spawn() catch return error.SqliteFailed;
+    const out = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.SqliteFailed;
     errdefer allocator.free(out);
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 64 * 1024);
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch return error.SqliteFailed;
     defer allocator.free(stderr);
-    const term = try child.wait();
+    const term = child.wait() catch return error.SqliteFailed;
     if (term.Exited != 0) {
-        std.debug.print("sqlite error: {s}\n", .{stderr});
+        std.debug.print("sqlite command failed\n", .{});
         return error.SqliteFailed;
     }
     return out;
@@ -496,11 +824,12 @@ fn hexToBytes(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 fn readRequestBody(allocator: std.mem.Allocator) ![]u8 {
     const len_text = try envOr(allocator, "CONTENT_LENGTH", "0");
     defer allocator.free(len_text);
-    const requested = std.fmt.parseInt(usize, len_text, 10) catch 0;
+    if (!plainDecimalDigits(len_text)) return error.InvalidRequestBody;
+    const requested = std.fmt.parseInt(usize, len_text, 10) catch return error.InvalidRequestBody;
     if (requested > max_body) return error.RequestBodyTooLarge;
     const body = try allocator.alloc(u8, requested);
     errdefer allocator.free(body);
-    try std.io.getStdIn().reader().readNoEof(body);
+    std.io.getStdIn().reader().readNoEof(body) catch return error.InvalidRequestBody;
     return body;
 }
 
@@ -524,16 +853,17 @@ fn cleanAlloc(allocator: std.mem.Allocator, value: []const u8, fallback: []const
 
 fn cleanAllocLimit(allocator: std.mem.Allocator, value: []const u8, fallback: []const u8, limit: usize) ![]u8 {
     const source = if (value.len == 0) fallback else value;
-    var out = try allocator.alloc(u8, @min(source.len, limit));
-    var n: usize = 0;
-    for (source) |c| {
-        if (n >= limit) break;
-        if (c >= 32 or c == '\n' or c == '\t') {
-            out[n] = c;
-            n += 1;
-        }
+    var view = std.unicode.Utf8View.init(source) catch return allocator.dupe(u8, "");
+    var it = view.iterator();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    while (it.nextCodepointSlice()) |slice| {
+        const cp = std.unicode.utf8Decode(slice) catch continue;
+        if (disallowedTextCodepoint(cp, true)) continue;
+        if (out.items.len + slice.len > limit) break;
+        try out.appendSlice(slice);
     }
-    return allocator.realloc(out, n);
+    return out.toOwnedSlice();
 }
 
 fn cleanAccountFieldAlloc(allocator: std.mem.Allocator, value: []const u8, fallback: []const u8) !?[]u8 {
@@ -542,10 +872,54 @@ fn cleanAccountFieldAlloc(allocator: std.mem.Allocator, value: []const u8, fallb
 
 fn cleanAccountFieldAllocLimit(allocator: std.mem.Allocator, value: []const u8, fallback: []const u8, limit: usize) !?[]u8 {
     const source = if (value.len == 0) fallback else value;
-    for (source) |c| {
-        if (c < 32 or c == '\t' or c == '\n' or c == '\r') return null;
+    if (hasDisallowedAccountCodepoint(source)) return null;
+    const trimmed = std.mem.trim(u8, source, " ");
+    return try allocator.dupe(u8, truncateUtf8Bytes(trimmed, limit));
+}
+
+fn siteName(allocator: std.mem.Allocator, configured_site: []const u8, server_name: []const u8) ![]u8 {
+    const source = if (configured_site.len > 0) configured_site else if (server_name.len > 0) server_name else "default";
+    if (hasDisallowedAccountCodepoint(source)) return error.InvalidSiteName;
+    const trimmed = std.mem.trim(u8, source, " ");
+    if (trimmed.len != source.len) return error.InvalidSiteName;
+    const truncated = truncateUtf8Bytes(trimmed, max_site);
+    if (truncated.len != trimmed.len) return error.InvalidSiteName;
+    if (truncated.len == 0) return allocator.dupe(u8, "default");
+    return allocator.dupe(u8, truncated);
+}
+
+fn hasDisallowedAccountCodepoint(source: []const u8) bool {
+    var view = std.unicode.Utf8View.init(source) catch return true;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (disallowedTextCodepoint(cp, false)) return true;
     }
-    return try allocator.dupe(u8, source[0..@min(source.len, limit)]);
+    return false;
+}
+
+fn truncateUtf8Bytes(source: []const u8, limit: usize) []const u8 {
+    var view = std.unicode.Utf8View.init(source) catch return "";
+    var it = view.iterator();
+    var end: usize = 0;
+    while (it.nextCodepointSlice()) |slice| {
+        if (end + slice.len > limit) break;
+        end += slice.len;
+    }
+    return source[0..end];
+}
+
+fn disallowedTextCodepoint(cp: u21, allow_text_whitespace: bool) bool {
+    if (cp < 32) return !(allow_text_whitespace and (cp == '\n' or cp == '\t'));
+    if (cp >= 127 and cp <= 159) return true;
+    if (cp >= 0x200B and cp <= 0x200F) return true;
+    if (cp >= 0x202A and cp <= 0x202E) return true;
+    if (cp >= 0x2060 and cp <= 0x206F) return true;
+    if (cp >= 0xFE00 and cp <= 0xFE0F) return true;
+    if (cp == 0xFEFF) return true;
+    if (cp >= 0xFFF9 and cp <= 0xFFFB) return true;
+    if (cp >= 0xE0000 and cp <= 0xE007F) return true;
+    if (cp >= 0xE0100 and cp <= 0xE01EF) return true;
+    return false;
 }
 
 fn nowIso(allocator: std.mem.Allocator) ![]u8 {
@@ -573,7 +947,17 @@ fn envInt(allocator: std.mem.Allocator, key: []const u8, fallback: i64) i64 {
     const value = envOr(allocator, key, "") catch return fallback;
     defer allocator.free(value);
     if (value.len == 0) return fallback;
+    if (!plainDecimalDigits(value)) return fallback;
     return std.fmt.parseInt(i64, value, 10) catch fallback;
+}
+
+fn envPositiveUsize(allocator: std.mem.Allocator, key: []const u8, fallback: usize) usize {
+    const value = envOr(allocator, key, "") catch return fallback;
+    defer allocator.free(value);
+    if (value.len == 0) return fallback;
+    if (!plainDecimalDigits(value)) return fallback;
+    const parsed = std.fmt.parseInt(usize, value, 10) catch return fallback;
+    return @max(@as(usize, 1), parsed);
 }
 
 fn rateLimit(allocator: std.mem.Allocator, action: []const u8, site: []const u8, ip: []const u8, fallback_limit: usize) !bool {
@@ -654,7 +1038,7 @@ fn loadComments(allocator: std.mem.Allocator, site: []const u8, thread: []const 
     var comments = std.ArrayList(Comment).init(allocator);
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
-        if (line_raw.len == 0 or comments.items.len >= max_comments) continue;
+        if (line_raw.len == 0 or comments.items.len >= envPositiveUsize(allocator, "JCOMMENT_MAX_COMMENTS_PER_THREAD", max_comments)) continue;
         const line = std.mem.trimRight(u8, line_raw, "\r");
         var fields = std.mem.splitScalar(u8, line, '\t');
         const id = fields.next() orelse continue;
@@ -769,6 +1153,8 @@ fn insertComment(allocator: std.mem.Allocator, site: []const u8, thread: []const
 }
 
 fn insertCommentChecked(allocator: std.mem.Allocator, site: []const u8, thread: []const u8, c: Comment) !bool {
+    const max_thread_comments = envPositiveUsize(allocator, "JCOMMENT_MAX_COMMENTS_PER_THREAD", max_comments);
+    const max_total_site_comments = envPositiveUsize(allocator, "JCOMMENT_MAX_COMMENTS_PER_SITE", max_site_comments);
     const sql_site = try sqlText(allocator, site);
     defer allocator.free(sql_site);
     const sql_thread = try sqlText(allocator, thread);
@@ -793,10 +1179,9 @@ fn insertCommentChecked(allocator: std.mem.Allocator, site: []const u8, thread: 
         \\select changes();
         \\commit;
     , .{
-        id, sql_site, sql_thread, parent_id, author, body, created_at, c.score,
-        sql_site, max_site_comments,
-        sql_site, sql_thread, max_comments,
-        parent_id, sql_site, sql_thread, parent_id,
+        id,        sql_site,                sql_thread, parent_id,  author,              body,      created_at, c.score,
+        sql_site,  max_total_site_comments, sql_site,   sql_thread, max_thread_comments, parent_id, sql_site,   sql_thread,
+        parent_id,
     });
     defer allocator.free(sql);
     const data = try sqliteQuery(allocator, sql);
@@ -888,7 +1273,7 @@ fn printCapabilities(w: anytype) !void {
     const localhost_voting = envEnabled(std.heap.page_allocator, "JCOMMENT_LOCALHOST_VOTING_ENABLED", false);
     const reset_enabled = envEnabled(std.heap.page_allocator, "JCOMMENT_PASSWORD_RESET_ENABLED", false);
     const require_login_to_post = envEnabled(std.heap.page_allocator, "JCOMMENT_REQUIRE_LOGIN_TO_POST", false);
-    const mode = emailMode(std.heap.page_allocator);
+    const mode = try emailMode(std.heap.page_allocator);
     defer std.heap.page_allocator.free(mode);
     try w.writeAll("{\"voting\":");
     try w.writeAll(if (voting_enabled and (login_enabled or localhost_voting)) "true" else "false");
@@ -963,11 +1348,11 @@ fn handleAdd(allocator: std.mem.Allocator, thread: []const u8, site: []const u8,
             try jsonError(404, "Not Found", "Parent comment was not found");
             return;
         }
-        if (try siteCommentCount(allocator, site) >= max_site_comments) {
+        if (try siteCommentCount(allocator, site) >= envPositiveUsize(allocator, "JCOMMENT_MAX_COMMENTS_PER_SITE", max_site_comments)) {
             try jsonError(507, "Insufficient Storage", "Comment store is full for this site");
             return;
         }
-        if (try threadCommentCount(allocator, site, thread) >= max_comments) {
+        if (try threadCommentCount(allocator, site, thread) >= envPositiveUsize(allocator, "JCOMMENT_MAX_COMMENTS_PER_THREAD", max_comments)) {
             try jsonError(507, "Insufficient Storage", "Comment store is full");
             return;
         }
@@ -977,8 +1362,8 @@ fn handleAdd(allocator: std.mem.Allocator, thread: []const u8, site: []const u8,
     try listResponse(allocator, site, thread, sort);
 }
 
-fn emailMode(allocator: std.mem.Allocator) []u8 {
-    return envOr(allocator, "JCOMMENT_EMAIL_MODE", "none") catch unreachable;
+fn emailMode(allocator: std.mem.Allocator) ![]u8 {
+    return envOr(allocator, "JCOMMENT_EMAIL_MODE", "none");
 }
 
 fn validEmail(value: []const u8) bool {
@@ -999,9 +1384,26 @@ fn reservedUsername(allocator: std.mem.Allocator, username: []const u8) !bool {
     var items = std.mem.splitScalar(u8, configured, ',');
     while (items.next()) |item_raw| {
         const item = std.mem.trim(u8, item_raw, " \t\r\n");
-        if (item.len > 0 and std.ascii.eqlIgnoreCase(item, username)) return true;
+        const normalized = (try cleanAccountFieldAllocLimit(allocator, item, "", max_username)) orelse continue;
+        defer allocator.free(normalized);
+        if (normalized.len > 0 and std.ascii.eqlIgnoreCase(normalized, username)) return true;
     }
     return false;
+}
+
+fn validReservedUsernames(allocator: std.mem.Allocator, configured: []const u8) !bool {
+    var items = std.mem.splitScalar(u8, configured, ',');
+    var count: usize = 0;
+    while (items.next()) |item_raw| {
+        if (count >= 256) return false;
+        count += 1;
+        const item = std.mem.trim(u8, item_raw, " \t\r\n");
+        if (item.len == 0 or item.len > 256) return false;
+        const normalized = (try cleanAccountFieldAllocLimit(allocator, item, "", max_username)) orelse return false;
+        defer allocator.free(normalized);
+        if (normalized.len == 0) return false;
+    }
+    return count > 0;
 }
 
 fn findAccountLine(allocator: std.mem.Allocator, site: []const u8, username: []const u8) !?[]u8 {
@@ -1074,7 +1476,7 @@ fn writeSession(allocator: std.mem.Allocator, site: []const u8, username: []cons
 }
 
 fn validCookieName(value: []const u8) bool {
-    if (value.len == 0) return false;
+    if (value.len == 0 or value.len > 256) return false;
     for (value) |c| {
         if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return false;
     }
@@ -1089,7 +1491,7 @@ fn sessionCookie(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     const max_age = @max(@as(i64, 1), @divFloor(ttl_ms, 1000));
     const raw_same_site = try envOr(allocator, "JCOMMENT_SESSION_COOKIE_SAMESITE", "Lax");
     defer allocator.free(raw_same_site);
-    const same_site = if (std.mem.eql(u8, raw_same_site, "Strict") or std.mem.eql(u8, raw_same_site, "None")) raw_same_site else "Lax";
+    const same_site = if (validCookieSameSite(raw_same_site)) raw_same_site else "Lax";
     const secure = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_SECURE", true);
     return std.fmt.allocPrint(allocator, "{s}={s}; HttpOnly; Path=/; Max-Age={d}; SameSite={s}{s}", .{
         name,
@@ -1106,7 +1508,6 @@ fn accountResponse(allocator: std.mem.Allocator, site: []const u8, username: []c
     const created = try nowIso(allocator);
     defer allocator.free(created);
     const cookie_enabled = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_ENABLED", false);
-    const expose_token = envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_EXPOSE_TOKEN", false);
     const cookie = if (cookie_enabled) try sessionCookie(allocator, token) else null;
     defer if (cookie) |value| allocator.free(value);
 
@@ -1120,7 +1521,7 @@ fn accountResponse(allocator: std.mem.Allocator, site: []const u8, username: []c
     try w.writeAll(",\"createdAt\":");
     try std.json.stringify(created, .{}, w);
     try w.writeAll("}");
-    if (!cookie_enabled or expose_token) {
+    if (!cookie_enabled) {
         try w.writeAll(",\"token\":");
         try std.json.stringify(token, .{}, w);
     }
@@ -1137,22 +1538,22 @@ fn handleSignup(allocator: std.mem.Allocator, site: []const u8, body: []const u8
     const username = (try cleanAccountFieldAllocLimit(allocator, raw_username, "", max_username)) orelse return jsonError(400, "Bad Request", "Username contains invalid characters");
     defer allocator.free(username);
     const email = (try cleanAccountFieldAllocLimit(allocator, raw_email, "", max_email)) orelse return jsonError(400, "Bad Request", "Email contains invalid characters");
-	    defer allocator.free(email);
-	    if (username.len == 0) return jsonError(400, "Bad Request", "Username is required");
-	    if (try reservedUsername(allocator, username)) return jsonError(400, "Bad Request", "Username is reserved for this site");
-	    if (password.len < 8) return jsonError(400, "Bad Request", "Password must be at least 8 characters");
+    defer allocator.free(email);
+    if (username.len == 0) return jsonError(400, "Bad Request", "Username is required");
+    if (try reservedUsername(allocator, username)) return jsonError(400, "Bad Request", "Username is reserved for this site");
+    if (password.len < 8) return jsonError(400, "Bad Request", "Password must be at least 8 characters");
     if (password.len > 256) return jsonError(400, "Bad Request", "Password must be at most 256 characters");
-    const mode = emailMode(allocator);
+    const mode = try emailMode(allocator);
     defer allocator.free(mode);
     if (std.mem.eql(u8, mode, "required") and !validEmail(email)) return jsonError(400, "Bad Request", "Email is required");
     if (!std.mem.eql(u8, mode, "none") and email.len > 0 and !validEmail(email)) return jsonError(400, "Bad Request", "Email is invalid");
-	    if (std.mem.eql(u8, mode, "none") and email.len != 0) return jsonError(400, "Bad Request", "Email is disabled for this site");
-	    if (try findAccountLine(allocator, site, username)) |existing| {
-	        allocator.free(existing);
-	        const dummy_hash = try hashPassword(allocator, password);
-	        allocator.free(dummy_hash);
-	        return duplicateSignupResponse(allocator);
-	    }
+    if (std.mem.eql(u8, mode, "none") and email.len != 0) return jsonError(400, "Bad Request", "Email is disabled for this site");
+    if (try findAccountLine(allocator, site, username)) |existing| {
+        allocator.free(existing);
+        const dummy_hash = try hashPassword(allocator, password);
+        allocator.free(dummy_hash);
+        return duplicateSignupResponse(allocator);
+    }
 
     const hash = try hashPassword(allocator, password);
     defer allocator.free(hash);
@@ -1192,51 +1593,56 @@ fn handleLogin(allocator: std.mem.Allocator, site: []const u8, body: []const u8)
     defer allocator.free(raw_username);
     const password = try jsonField(allocator, body, "password");
     defer allocator.free(password);
-    if (password.len > 256) return jsonError(401, "Unauthorized", "Invalid username or password");
-    const username = (try cleanAccountFieldAllocLimit(allocator, raw_username, "", max_username)) orelse return jsonError(401, "Unauthorized", "Invalid username or password");
+    if (password.len > 256) return invalidLogin();
+    const username = (try cleanAccountFieldAllocLimit(allocator, raw_username, "", max_username)) orelse return invalidLogin();
     defer allocator.free(username);
     const line = (try findAccountLine(allocator, site, username)) orelse {
         const hash = try hashPassword(allocator, password);
         allocator.free(hash);
-        return jsonError(401, "Unauthorized", "Invalid username or password");
+        return invalidLogin();
     };
     defer allocator.free(line);
     const hash = accountField(line, 3);
-    if (!verifyPassword(allocator, hash, password)) return jsonError(401, "Unauthorized", "Invalid username or password");
+    if (!verifyPassword(allocator, hash, password)) return invalidLogin();
     try accountResponse(allocator, site, username);
+}
+
+fn invalidLogin() !void {
+    delayAuthResponse();
+    return jsonError(401, "Unauthorized", "Invalid username or password");
 }
 
 fn handleResetRequest(allocator: std.mem.Allocator, site: []const u8, body: []const u8) !void {
     if (!envEnabled(allocator, "JCOMMENT_PASSWORD_RESET_ENABLED", false)) return jsonError(403, "Forbidden", "Password reset is disabled for this site");
-    const mode = emailMode(allocator);
+    const mode = try emailMode(allocator);
     defer allocator.free(mode);
     if (std.mem.eql(u8, mode, "none")) return jsonError(403, "Forbidden", "Password reset requires email support");
     const raw_username = try jsonField(allocator, body, "username");
     defer allocator.free(raw_username);
     const raw_email = try jsonField(allocator, body, "email");
     defer allocator.free(raw_email);
-	    const username = (try cleanAccountFieldAllocLimit(allocator, raw_username, "", max_username)) orelse {
-	        try resetDummyWork(allocator);
-	        return resetRequestOk();
-	    };
-	    defer allocator.free(username);
-	    const email = (try cleanAccountFieldAllocLimit(allocator, raw_email, "", max_email)) orelse {
-	        try resetDummyWork(allocator);
-	        return resetRequestOk();
-	    };
-	    defer allocator.free(email);
-	    if (!validEmail(email)) {
-	        try resetDummyWork(allocator);
-	        return resetRequestOk();
-	    }
+    const username = (try cleanAccountFieldAllocLimit(allocator, raw_username, "", max_username)) orelse {
+        try resetDummyWork(allocator);
+        return resetRequestOk();
+    };
+    defer allocator.free(username);
+    const email = (try cleanAccountFieldAllocLimit(allocator, raw_email, "", max_email)) orelse {
+        try resetDummyWork(allocator);
+        return resetRequestOk();
+    };
+    defer allocator.free(email);
+    if (!validEmail(email)) {
+        try resetDummyWork(allocator);
+        return resetRequestOk();
+    }
     const line_opt = try findAccountLine(allocator, site, username);
     if (line_opt) |line| {
         defer allocator.free(line);
         if (std.mem.eql(u8, accountField(line, 2), email)) {
-	            if (try resetTokenPending(allocator, site, username)) {
-	                try resetDummyWork(allocator);
-	                return resetRequestOk();
-	            }
+            if (try resetTokenPending(allocator, site, username)) {
+                try resetDummyWork(allocator);
+                return resetRequestOk();
+            }
             const token = try makeId(allocator);
             defer allocator.free(token);
             const sql_site = try sqlText(allocator, site);
@@ -1249,19 +1655,25 @@ fn handleResetRequest(allocator: std.mem.Allocator, site: []const u8, body: []co
             defer allocator.free(sql_token);
             const ttl_ms = @max(@as(i64, 1), envInt(allocator, "JCOMMENT_PASSWORD_RESET_TTL_MS", 3600_000));
             const expires_at = nowMs() + ttl_ms;
-            const sql = try std.fmt.allocPrint(allocator, "insert into resets(site, username, token, expires_at) values({s}, {s}, {s}, {d});", .{ sql_site, sql_username, sql_token, expires_at });
+            const sql = try std.fmt.allocPrint(allocator, "insert or ignore into resets(site, username, token, expires_at) values({s}, {s}, {s}, {d});", .{ sql_site, sql_username, sql_token, expires_at });
             defer allocator.free(sql);
             try sqliteExec(allocator, sql);
-            deliverResetToken(allocator, site, username, email, token) catch |err| {
+            if (!try resetTokenDigestExists(allocator, site, token_digest)) {
+                try resetDummyWork(allocator);
+                return resetRequestOk();
+            }
+            deliverResetToken(allocator, site, username, email, token) catch {
                 const cleanup = try std.fmt.allocPrint(allocator, "delete from resets where site = {s} and token = {s};", .{ sql_site, sql_token });
                 defer allocator.free(cleanup);
                 sqliteExec(allocator, cleanup) catch {};
-                return err;
+                std.debug.print("password reset command failed\n", .{});
+                try resetDummyWork(allocator);
+                return resetRequestOk();
             };
-	        }
-	    } else {
-	        try resetDummyWork(allocator);
-	    }
+        }
+    } else {
+        try resetDummyWork(allocator);
+    }
     try resetRequestOk();
 }
 
@@ -1306,7 +1718,7 @@ fn deliverResetToken(allocator: std.mem.Allocator, site: []const u8, username: [
     defer allocator.free(stderr);
     const term = try child.wait();
     if (term.Exited != 0) {
-        std.debug.print("password reset command failed: {s}\n", .{stderr});
+        std.debug.print("password reset command failed\n", .{});
         return error.ResetCommandFailed;
     }
 }
@@ -1317,6 +1729,18 @@ fn resetTokenPending(allocator: std.mem.Allocator, site: []const u8, username: [
     const sql_username = try sqlText(allocator, username);
     defer allocator.free(sql_username);
     const sql = try std.fmt.allocPrint(allocator, "select 1 from resets where site = {s} and username = {s} and expires_at >= {d} limit 1;", .{ sql_site, sql_username, nowMs() });
+    defer allocator.free(sql);
+    const data = try sqliteQuery(allocator, sql);
+    defer allocator.free(data);
+    return std.mem.trim(u8, data, "\r\n\t ").len > 0;
+}
+
+fn resetTokenDigestExists(allocator: std.mem.Allocator, site: []const u8, token_digest: []const u8) !bool {
+    const sql_site = try sqlText(allocator, site);
+    defer allocator.free(sql_site);
+    const sql_token = try sqlText(allocator, token_digest);
+    defer allocator.free(sql_token);
+    const sql = try std.fmt.allocPrint(allocator, "select 1 from resets where site = {s} and token = {s} limit 1;", .{ sql_site, sql_token });
     defer allocator.free(sql);
     const data = try sqliteQuery(allocator, sql);
     defer allocator.free(data);
@@ -1353,9 +1777,31 @@ fn handleResetConfirm(allocator: std.mem.Allocator, site: []const u8, body: []co
     defer allocator.free(sql_username);
     const sql_hash = try sqlText(allocator, new_hash);
     defer allocator.free(sql_hash);
-    const update = try std.fmt.allocPrint(allocator, "begin immediate; update accounts set password_hash = {s} where site = {s} and username = {s}; delete from resets where site = {s} and username = {s}; delete from sessions where site = {s} and username = {s}; commit;", .{ sql_hash, sql_site, sql_username, sql_site, sql_username, sql_site, sql_username });
-    defer allocator.free(update);
-    try sqliteExec(allocator, update);
+    const reset_now = nowMs();
+    const consume = try std.fmt.allocPrint(allocator,
+        \\begin immediate;
+        \\update accounts set password_hash = {s}
+        \\  where site = {s}
+        \\    and username = {s}
+        \\    and exists (select 1 from resets where site = {s} and username = {s} and token = {s} and expires_at >= {d});
+        \\select changes();
+        \\delete from sessions where site = {s}
+        \\  and username = {s}
+        \\  and exists (select 1 from resets where site = {s} and username = {s} and token = {s} and expires_at >= {d});
+        \\delete from resets where site = {s}
+        \\  and username = {s}
+        \\  and exists (select 1 from resets where site = {s} and username = {s} and token = {s} and expires_at >= {d});
+        \\commit;
+    , .{
+        sql_hash,     sql_site,     sql_username, sql_site,     sql_username, sql_token, reset_now,
+        sql_site,     sql_username, sql_site,     sql_username, sql_token,    reset_now, sql_site,
+        sql_username, sql_site,     sql_username, sql_token,    reset_now,
+    });
+    defer allocator.free(consume);
+    const consume_data = try sqliteQuery(allocator, consume);
+    defer allocator.free(consume_data);
+    const consumed = std.mem.trim(u8, consume_data, "\r\n\t ");
+    if (!std.mem.eql(u8, consumed, "1")) return jsonError(400, "Bad Request", "Invalid or expired reset token");
     const w = stdout();
     try status(201, "Created");
     try w.writeAll("{\"ok\":true}");
@@ -1364,7 +1810,7 @@ fn handleResetConfirm(allocator: std.mem.Allocator, site: []const u8, body: []co
 fn bearerToken(allocator: std.mem.Allocator) ![]u8 {
     const auth = try envOr(allocator, "HTTP_AUTHORIZATION", "");
     defer allocator.free(auth);
-    if (std.mem.startsWith(u8, auth, "Bearer ")) return allocator.dupe(u8, auth[7..]);
+    if (std.mem.startsWith(u8, auth, "Bearer ")) return cleanAllocLimit(allocator, auth[7..], "", max_token);
     if (!envEnabled(allocator, "JCOMMENT_SESSION_COOKIE_ENABLED", false)) return allocator.dupe(u8, "");
     const raw_name = try envOr(allocator, "JCOMMENT_SESSION_COOKIE_NAME", "jcomment_session");
     defer allocator.free(raw_name);
@@ -1375,7 +1821,7 @@ fn bearerToken(allocator: std.mem.Allocator) ![]u8 {
     while (parts.next()) |part_raw| {
         const part = std.mem.trim(u8, part_raw, " ");
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        if (std.mem.eql(u8, part[0..eq], name)) return allocator.dupe(u8, part[eq + 1 ..]);
+        if (std.mem.eql(u8, part[0..eq], name)) return cleanAllocLimit(allocator, part[eq + 1 ..], "", max_token);
     }
     return allocator.dupe(u8, "");
 }
@@ -1419,7 +1865,7 @@ fn loginTokenUsername(allocator: std.mem.Allocator, site: []const u8, token: []c
     defer allocator.free(data);
     const username_hex = std.mem.trim(u8, data, "\r\n\t ");
     if (username_hex.len == 0) {
-        const cleanup = try std.fmt.allocPrint(allocator, "delete from sessions where token = {s};", .{sql_token});
+        const cleanup = try std.fmt.allocPrint(allocator, "delete from sessions where token = {s} and site = {s};", .{ sql_token, sql_site });
         defer allocator.free(cleanup);
         try sqliteExec(allocator, cleanup);
         return null;
@@ -1436,7 +1882,7 @@ fn clientIp(allocator: std.mem.Allocator) ![]u8 {
             return value;
         }
     }
-    if (remote.len > 0) {
+    if (remote.len > 0 and (isLocalhost(remote) or validIpLiteral(remote))) {
         return remote;
     }
     allocator.free(remote);
@@ -1444,7 +1890,11 @@ fn clientIp(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn isLocalhost(ip: []const u8) bool {
-    return std.mem.eql(u8, ip, "localhost") or std.mem.eql(u8, ip, "::1") or std.mem.startsWith(u8, ip, "127.");
+    if (std.mem.eql(u8, ip, "localhost") or std.mem.eql(u8, ip, "::1") or std.mem.eql(u8, ip, "0:0:0:0:0:0:0:1")) return true;
+    if (!validIpv4(ip)) return false;
+    const first_dot = std.mem.indexOfScalar(u8, ip, '.') orelse return false;
+    const first = std.fmt.parseInt(u8, ip[0..first_dot], 10) catch return false;
+    return first == 127;
 }
 
 fn trustedProxyIp(allocator: std.mem.Allocator) !?[]u8 {
@@ -1476,6 +1926,7 @@ fn validIpv4(value: []const u8) bool {
     var count: usize = 0;
     while (parts.next()) |part| {
         if (part.len == 0 or part.len > 3) return false;
+        if (!plainDecimalDigits(part)) return false;
         _ = std.fmt.parseInt(u8, part, 10) catch return false;
         count += 1;
     }
@@ -1547,22 +1998,20 @@ fn handleVote(allocator: std.mem.Allocator, thread: []const u8, site: []const u8
         return;
     }
 
-	    const id = try jsonField(allocator, body, "id");
-	    defer allocator.free(id);
-	    const action = try jsonField(allocator, body, "action");
-	    defer allocator.free(action);
-	    if (!std.mem.eql(u8, action, "upvote")) {
-	        try jsonError(400, "Bad Request", "Unsupported vote action");
-	        return;
-	    }
-	    if (!try commentExists(allocator, site, thread, id)) {
+    const id = try jsonField(allocator, body, "id");
+    defer allocator.free(id);
+    const action = try jsonField(allocator, body, "action");
+    defer allocator.free(action);
+    if (!std.mem.eql(u8, action, "upvote")) {
+        try jsonError(400, "Bad Request", "Unsupported vote action");
+        return;
+    }
+    if (!try commentExists(allocator, site, thread, id)) {
         try jsonError(404, "Not Found", "Comment was not found");
         return;
     }
 
-    const max_text = try envOr(allocator, "JCOMMENT_MAX_VOTES_PER_IDENTITY", "1");
-    defer allocator.free(max_text);
-    const max_votes = @max(@as(usize, 1), std.fmt.parseInt(usize, max_text, 10) catch 1);
+    const max_votes = envPositiveUsize(allocator, "JCOMMENT_MAX_VOTES_PER_IDENTITY", 1);
 
     const login_enabled = envEnabled(allocator, "JCOMMENT_LOGIN_ENABLED", true);
     const token = try bearerToken(allocator);

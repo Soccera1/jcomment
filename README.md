@@ -67,7 +67,7 @@ Run `npm run check:cgi` or `npm run check:all` when you want to validate the Zig
 npm run demo
 ```
 
-Open `http://127.0.0.1:8787/demo/`. The demo runner is a small Zig HTTP server that serves `dist/` and delegates `/api/comments` to `dist/jcomment-cgi`.
+Open `http://127.0.0.1:8787/demo/`. The demo runner is a small Zig HTTP server that serves only the public demo assets from `dist/` and delegates `/api/comments` to `dist/jcomment-cgi`.
 
 `npm run demo` requires Zig because it builds and runs the local Zig demo server. Deploying the browser widget, Express adapter, Vercel/Netlify adapters, or Cloudflare Worker does not require Zig.
 
@@ -111,13 +111,15 @@ The API accepts and returns JSON comments:
 
 `POST /api/comments/signup` accepts `{ "username": "...", "password": "...", "email": "..." }`.
 
-`POST /api/comments/login` accepts `{ "username": "...", "password": "..." }` and returns a bearer token scoped to the server-configured site.
+`POST /api/comments/login` accepts `{ "username": "...", "password": "..." }`. Cookie-session deployments set an HttpOnly session cookie and do not expose a bearer token; bearer-token-only deployments return a token scoped to the server-configured site.
 
 `POST /api/comments/reset/request` accepts `{ "username": "...", "email": "..." }` when password reset is enabled.
 
 `POST /api/comments/reset/confirm` accepts `{ "token": "...", "password": "..." }`.
 
-The server owns the site/auth realm. Query-string `site` values and widget `data-site` values are not trusted for authorization; configure `site` in JavaScript adapters or `JCOMMENT_SITE`/`SERVER_NAME` in CGI/Worker deployments.
+The JavaScript handler accepts only the configured API base and documented auth subpaths. The default base is `/api/comments`; pass `apiPath: "/your/comments/path"` to `createCommentHandler` when mounting the reusable handler somewhere else.
+
+The server owns the site/auth realm. Query-string `site` values and widget `data-site` values are not trusted for authorization; configure `site` in JavaScript adapters, `JCOMMENT_SITE` in Worker/Vercel/Netlify deployments, or `JCOMMENT_SITE`/`SERVER_NAME` in CGI deployments. Site realm values are exact database partition keys: they must not contain control characters or surrounding whitespace, and must be at most 120 bytes.
 
 Duplicate signup requests return a generic accepted response by default instead of revealing whether a username already exists. JavaScript deployments can opt back into explicit duplicate errors with `voteIdentity.accounts.discloseAccountExistence = true`; CGI and Worker deployments can set `JCOMMENT_DISCLOSE_ACCOUNT_EXISTENCE=1`.
 
@@ -127,7 +129,7 @@ Posting can optionally require a per-site login token. This is independent of IP
 
 When login-required posting is enabled, the stored comment author is taken from the authenticated account username. The browser still shows the name field for unauthenticated deployments, but authenticated posts cannot spoof another display name by changing request JSON.
 
-Invalid server configurations fail at startup or request initialization. For example, requiring login to post while login is disabled is invalid, as is enabling password reset while email collection is disabled. `BROKEN_CONFIG=1` downgrades these errors to warnings, but this is explicitly unsupported and may break any number of things; use it only to inspect or temporarily recover a deployment.
+Invalid server configurations fail at startup or request initialization. For example, requiring login to post while login is disabled is invalid, as is enabling password reset while email collection is disabled. Worker and CGI deployments also reject malformed boolean or positive-integer security environment variables instead of silently falling back to defaults. `BROKEN_CONFIG=1` downgrades these errors to warnings, but this is explicitly unsupported and may break any number of things; use it only to inspect or temporarily recover a deployment.
 
 ## Vote Identity And Privacy
 
@@ -188,13 +190,13 @@ const handleComments = createCommentHandler({
 });
 ```
 
-jcomment stores comments, votes, accounts, sessions, and reset tokens in SQLite. The JavaScript core defaults to `jcomment.sqlite3`; set `JCOMMENT_DB` or pass `createSqliteStore({ path })` to choose a database file. The built-in JavaScript SQLite store sets the database file mode to `0600` after initialization; deploy it in a private directory so SQLite sidecar files and backups inherit the same access boundary. Session and reset tokens are stored as SHA-256 digests, and raw password reset tokens should be sent through the site's own email provider.
+jcomment stores comments, votes, accounts, sessions, and reset tokens in SQLite. The JavaScript core defaults to `jcomment.sqlite3`; set `JCOMMENT_DB` or pass `createSqliteStore({ path })` to choose a database file. The built-in JavaScript SQLite store rejects group- or world-writable database directories, symlinked database directories, final database-path and sidecar-path symlinks, and sets the database file mode, plus any existing SQLite sidecar files, to `0600` after initialization; deploy it in a private directory so backups inherit the same access boundary. Session and reset tokens are stored as SHA-256 digests, and raw password reset tokens should be sent through the site's own email provider.
 
 Login sessions expire after 30 days by default. For JavaScript deployments, set `voteIdentity.accounts.session.ttlMs` to choose a different lifetime. Password reset tokens expire after one hour by default through `voteIdentity.accounts.passwordReset.ttlMs`, and password reset invalidates existing sessions for that account.
 
-If a valid password reset token is already pending for an account, another reset request returns the same generic success response without issuing a new token. This avoids account-specific reset email floods while preserving account enumeration resistance. If reset-token delivery fails, jcomment deletes the newly created token before returning an error.
+If a valid password reset token is already pending for an account, another reset request returns the same generic success response without issuing a new token. This avoids account-specific reset email floods while preserving account enumeration resistance. If reset-token delivery fails, jcomment deletes the newly created token, logs the delivery failure server-side, and still returns the same generic success response so delivery outages do not reveal which accounts exist.
 
-For HTTPS requests, signup and login responses use HttpOnly cookie sessions by default so the browser widget does not need JavaScript-readable session tokens. Plain HTTP development requests still receive bearer tokens unless cookie sessions are explicitly enabled with `secure: false`; the browser widget does not store those fallback bearer tokens unless you opt in with `data-token-storage="session"` or `data-token-storage="local"` for development or non-browser-token workflows.
+For HTTPS requests, signup and login responses use HttpOnly cookie sessions by default so the browser widget does not need JavaScript-readable session tokens. Plain HTTP development requests still receive bearer tokens unless cookie sessions are explicitly enabled with `secure: false`; the browser widget keeps those fallback bearer tokens in memory only and does not persist them to `localStorage` or `sessionStorage`.
 
 ```js
 const handleComments = createCommentHandler({
@@ -248,9 +250,9 @@ const handleComments = createCommentHandler({
 
 Expired session and password-reset token rows are purged during startup and auth-related requests.
 
-CORS is off by default. For cross-origin embeds with cookies, pass an explicit `cors` origin such as `cors: "https://www.example.com"`. State-changing browser requests are also checked against the request origin, so cross-origin browser clients must use an explicit trusted origin rather than `cors: "*"`. Use `cors: "*"` only when a public non-browser or bearer-token API is intentional and no cookie session is used.
+CORS is off by default. For cross-origin embeds with cookies, pass an explicit `cors` origin such as `cors: "https://www.example.com"`; the JavaScript core accepts only `*` or an exact absolute `http(s)` origin here. State-changing browser requests are also checked against the request origin, so cross-origin browser clients must use an explicit trusted origin rather than `cors: "*"`. Use `cors: "*"` only when a public non-browser or bearer-token API is intentional and no cookie session is used.
 
-Unsafe requests (`POST` and `PATCH`) must use JSON when they send a `Content-Type` header. Browser cross-site unsafe requests are rejected with `Origin`/`Sec-Fetch-Site` checks to protect cookie and IP-based identities from CSRF. Cookie-authenticated unsafe requests also require browser origin metadata, so legacy clients without `Origin` or `Sec-Fetch-Site` should use bearer tokens instead of cookie sessions. If you need to allow additional browser origins beyond the same origin and the configured CORS origin, configure them explicitly:
+Unsafe requests (`POST` and `PATCH`) must use JSON when they send a `Content-Type` header. Browser cross-site unsafe requests are rejected with `Origin`/`Sec-Fetch-Site` checks to protect cookie and IP-based identities from CSRF. Cookie-authenticated unsafe requests also require either a trusted `Origin` or `Sec-Fetch-Site: same-origin`, so legacy clients without same-origin browser metadata should use bearer tokens instead of cookie sessions. If you need to allow additional browser origins beyond the same origin and the configured CORS origin, configure them explicitly as exact absolute `http(s)` origins:
 
 ```js
 const handleComments = createCommentHandler({
@@ -275,7 +277,7 @@ const handleComments = createCommentHandler({
 });
 ```
 
-If both login and IP storage are disabled while voting remains enabled, jcomment emits a server startup warning. In that configuration, the server has no durable identity for non-localhost voters, so upvotes can be easily manipulated by repeated requests. Use this only for low-stakes demos or sites where vote integrity does not matter.
+If both login and IP storage are disabled while voting remains enabled, jcomment emits a server startup warning. In that configuration, the server has no durable identity for non-localhost voters, so vote requests are rejected. Use this only when voting is intentionally unavailable or for local development with explicit localhost voting.
 
 If you do not want login and cannot lawfully or safely store IP addresses, the recommended production setting is to disable voting:
 
@@ -294,8 +296,8 @@ For the native CGI server, use environment variables:
 JCOMMENT_EMAIL_MODE=required # none, optional, or required
 JCOMMENT_PASSWORD_RESET_ENABLED=1
 JCOMMENT_PASSWORD_RESET_COMMAND=/usr/local/bin/send-jcomment-reset
-JCOMMENT_LOGIN_ENABLED=0
-JCOMMENT_VOTING_ENABLED=0
+JCOMMENT_LOGIN_ENABLED=1
+JCOMMENT_VOTING_ENABLED=1
 JCOMMENT_REQUIRE_LOGIN_TO_POST=1
 BROKEN_CONFIG=0
 ```
@@ -362,15 +364,18 @@ The `server/` directory provides small adapters:
 
 The Zig CGI server is the generic server. The JavaScript files are integration adapters for JavaScript-based hosts.
 
-The Express adapter uses the same file-backed SQLite store as the JavaScript core. Mount it behind `express.json({ limit: "8kb" })` or a stricter equivalent. By default the adapter uses `req.socket.remoteAddress` for server-side rate limiting and optional IP vote identity; pass `getClientIp: req => ...` only when you have a trusted reverse-proxy boundary. Set `publicOrigin` or `JCOMMENT_PUBLIC_ORIGIN` to the canonical API origin when Express is behind a proxy, and set `allowedHosts` or `JCOMMENT_ALLOWED_HOSTS` to a comma-separated host allowlist so spoofed Host headers cannot influence same-origin CSRF checks. Vercel and Netlify functions must be pointed at a durable SQLite database path with `JCOMMENT_DB`; do not rely on the platform's ephemeral function filesystem for production data.
+The Express adapter uses the same file-backed SQLite store as the JavaScript core. Mount it behind `express.json({ limit: "8kb" })` or a stricter equivalent. By default the adapter uses `req.socket.remoteAddress` for server-side rate limiting and optional IP vote identity; pass `getClientIp: req => ...` only when you have a trusted reverse-proxy boundary. Cookie-capable Express deployments that use the default `security.sessionCookie.enabled = "auto"` must set `publicOrigin` or `JCOMMENT_PUBLIC_ORIGIN` to the canonical API origin so the adapter does not downgrade HTTPS login responses to JavaScript-readable bearer tokens when Express sees an internal HTTP hop. When cookie sessions are explicitly enabled or disabled, set `publicOrigin`/`JCOMMENT_PUBLIC_ORIGIN` or `allowedHosts`/`JCOMMENT_ALLOWED_HOSTS` so spoofed Host headers cannot influence same-origin CSRF checks. Vercel and Netlify functions must be pointed at a durable SQLite database path with `JCOMMENT_DB`; do not rely on the platform's ephemeral function filesystem for production data. Set `JCOMMENT_SITE` when those functions should share an auth/comment realm with another adapter or deployment. Cookie-capable Vercel and Netlify deployments must also set `JCOMMENT_PUBLIC_ORIGIN` to the canonical API origin, or explicitly set `JCOMMENT_SESSION_COOKIE_ENABLED=0` for bearer-token-only deployments. Requests that arrive on a different origin from `JCOMMENT_PUBLIC_ORIGIN` are rejected so alternate platform hostnames cannot become a parallel same-origin cookie surface.
 
-The Cloudflare Worker adapter uses Cloudflare D1. Bind a D1 database as `JCOMMENT_DB`. Because Workers cannot use Node's `node:sqlite` module, storage goes through D1. Account signup/login requires a service binding exposed as `JCOMMENT_ARGON2ID` with `hashPassword(password)` and `verifyPassword(password, stored)` methods. If `JCOMMENT_PASSWORD_RESET_ENABLED=1`, also bind `JCOMMENT_PASSWORD_RESET` to a service with `sendToken({ site, username, email, token })`; the Worker fails closed instead of creating undeliverable reset tokens when this binding is missing.
+The Cloudflare Worker adapter uses Cloudflare D1. Bind a D1 database as `JCOMMENT_DB`. Because Workers cannot use Node's `node:sqlite` module, storage goes through D1. Account signup/login requires a service binding exposed as `JCOMMENT_ARGON2ID` with `hashPassword(password)` and `verifyPassword(password, stored)` methods. If `JCOMMENT_PASSWORD_RESET_ENABLED=1`, also bind `JCOMMENT_PASSWORD_RESET` to a service with `sendToken({ site, username, email, token })`; the Worker fails closed instead of creating undeliverable reset tokens when this binding is missing. If you set `JCOMMENT_SITE` on a cookie-capable Worker, also set `JCOMMENT_PUBLIC_ORIGIN` to the canonical Worker origin, or explicitly set `JCOMMENT_SESSION_COOKIE_ENABLED=0` for bearer-token-only deployments. Requests that arrive on a different origin from `JCOMMENT_PUBLIC_ORIGIN` are rejected so alternate Worker hostnames cannot become a parallel same-origin cookie surface.
+
+Worker and serverless boolean environment variables must use `1`, `true`, `on`, `yes`, `0`, `false`, `off`, or `no`. Cookie mode also accepts `auto` where documented. Malformed boolean values fail closed.
 
 Common Cloudflare Worker environment variables:
 
 ```sh
 JCOMMENT_SITE=example.com
-JCOMMENT_LOGIN_ENABLED=0
+JCOMMENT_PUBLIC_ORIGIN=https://comments.example.com
+JCOMMENT_LOGIN_ENABLED=1
 JCOMMENT_VOTING_ENABLED=1
 JCOMMENT_REQUIRE_LOGIN_TO_POST=0
 JCOMMENT_MAX_VOTES_PER_IDENTITY=1
@@ -412,9 +417,11 @@ The CGI binary supports the same basic API shape:
 - `POST /api/comments/reset/request`
 - `POST /api/comments/reset/confirm`
 
-Set `JCOMMENT_DATA_DIR` to choose the directory for `jcomment.sqlite3`, which stores comments, votes, accounts, sessions, and reset tokens. This variable is required; do not store the database in a shared temporary directory for production. The CGI binary attempts to set the directory mode to `0700` on startup.
+Set `JCOMMENT_DATA_DIR` to choose the directory for `jcomment.sqlite3`, which stores comments, votes, accounts, sessions, and reset tokens. This variable is required; do not store the database in a shared temporary directory for production. Existing CGI data directories must already be private (`0700` or stricter) and must not be symlinks; the database, SQLite sidecars, and schema marker inside that directory must not be symlinks either. Newly created data directories are set to `0700`.
 
-The CGI server stores expiring sessions, expiring reset token digests, and persistent rate-limit counters in the same SQLite database. Use `JCOMMENT_SITE`, `JCOMMENT_SESSION_TTL_MS`, `JCOMMENT_PASSWORD_RESET_TTL_MS`, `JCOMMENT_RATE_LIMIT_ENABLED`, and `JCOMMENT_RATE_LIMIT_WINDOW_MS` to tune those controls. It enforces a 512-comment per-thread cap and a 5000-comment per-site cap inside the SQLite insert statement, plus the same public text-field limits as the JavaScript core. It reads only `REMOTE_ADDR` by default and fails closed for state-changing rate-limited requests when no client address is available; set `JCOMMENT_RATE_LIMIT_ALLOW_ANONYMOUS_IDENTITY=1` only for deliberately shared low-risk deployments. To use a forwarded IP, set `JCOMMENT_TRUST_PROXY_HEADERS=1` and choose exactly one trusted proxy header with `JCOMMENT_TRUST_PROXY_HEADER=cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`; this is honored only when `REMOTE_ADDR` is localhost, so deploy the CGI behind a same-host trusted proxy that strips incoming client copies of that header. CORS is disabled by default for CGI; set `JCOMMENT_CORS_ORIGIN=https://www.example.com` or `JCOMMENT_CORS_ORIGIN=*` only when cross-origin API access is intentional. Set `JCOMMENT_SQLITE_BIN` to an absolute sqlite3 path when `/usr/bin/sqlite3` is not correct for the host.
+The CGI server stores expiring sessions, expiring reset token digests, and persistent rate-limit counters in the same SQLite database. Use `JCOMMENT_SITE`, `JCOMMENT_SESSION_TTL_MS`, `JCOMMENT_PASSWORD_RESET_TTL_MS`, `JCOMMENT_RATE_LIMIT_ENABLED`, `JCOMMENT_RATE_LIMIT_WINDOW_MS`, `JCOMMENT_MAX_COMMENTS_PER_THREAD`, and `JCOMMENT_MAX_COMMENTS_PER_SITE` to tune those controls. It enforces comment caps inside the SQLite insert statement, plus the same public text-field limits as the JavaScript core. It reads only `REMOTE_ADDR` by default and fails closed for state-changing rate-limited requests when no client address is available; set `JCOMMENT_RATE_LIMIT_ALLOW_ANONYMOUS_IDENTITY=1` only for deliberately shared low-risk deployments. To use a forwarded IP, set `JCOMMENT_TRUST_PROXY_HEADERS=1` and choose exactly one trusted proxy header with `JCOMMENT_TRUST_PROXY_HEADER=cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`; this is honored only when `REMOTE_ADDR` is localhost, so deploy the CGI behind a same-host trusted proxy that strips incoming client copies of that header. CORS is disabled by default for CGI; set `JCOMMENT_CORS_ORIGIN=https://www.example.com` when cross-origin cookie use is intentional, or `JCOMMENT_CORS_ORIGIN=*` only for cookie-disabled public API deployments. Same-origin CSRF checks use `SERVER_NAME`, not client-supplied `HTTP_HOST`, so configure the server's canonical name correctly. If you set `JCOMMENT_SITE` on a cookie-capable CGI deployment, also set `JCOMMENT_PUBLIC_ORIGIN` to the canonical CGI origin, or keep cookie sessions disabled. Requests whose CGI origin does not match `JCOMMENT_PUBLIC_ORIGIN` are rejected. Set `JCOMMENT_SQLITE_BIN` to an absolute sqlite3 path when `/usr/bin/sqlite3` is not correct for the host.
+
+CGI boolean environment variables must use `1`, `true`, `on`, `yes`, `0`, `false`, `off`, or `no`. `JCOMMENT_EMAIL_MODE` must be `none`, `optional`, or `required`. `JCOMMENT_CORS_ORIGIN` must be `*` or an absolute `http(s)` origin, and `JCOMMENT_PUBLIC_ORIGIN` must be an exact absolute `http(s)` origin when set. `JCOMMENT_RESERVED_USERNAMES` entries must be non-empty account names without control, invisible, or variation-selector characters. `JCOMMENT_SESSION_COOKIE_NAME` must be a valid cookie name, and `JCOMMENT_SESSION_COOKIE_SAMESITE` must be `Strict`, `Lax`, or `None`. Numeric TTL, rate-window, vote-limit, and comment-quota environment variables must be positive integers. When `JCOMMENT_TRUST_PROXY_HEADERS=1`, `JCOMMENT_TRUST_PROXY_HEADER` must be exactly `cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`. Malformed security values are rejected instead of guessed so auth, cookie, proxy, and rate-limit controls do not silently change behavior.
 
 CGI password reset requires `JCOMMENT_PASSWORD_RESET_COMMAND` when `JCOMMENT_PASSWORD_RESET_ENABLED=1`. The command must be an absolute executable path; jcomment runs it without a shell and with a minimal environment containing `JCOMMENT_RESET_SITE`, `JCOMMENT_RESET_USERNAME`, and `JCOMMENT_RESET_EMAIL`. The raw reset token is written to the command's stdin with a trailing newline. Use that command to send the token through your email provider.
 
@@ -425,6 +432,7 @@ Example Apache-style CGI environment:
 ```apache
 SetEnv JCOMMENT_DATA_DIR /var/lib/jcomment
 SetEnv JCOMMENT_SITE example.com
+SetEnv JCOMMENT_PUBLIC_ORIGIN https://comments.example.com
 ScriptAlias /api/comments /usr/local/libexec/jcomment-cgi
 ScriptAlias /api/comments/login /usr/local/libexec/jcomment-cgi/login
 ScriptAlias /api/comments/signup /usr/local/libexec/jcomment-cgi/signup
@@ -432,9 +440,9 @@ ScriptAlias /api/comments/reset/request /usr/local/libexec/jcomment-cgi/reset/re
 ScriptAlias /api/comments/reset/confirm /usr/local/libexec/jcomment-cgi/reset/confirm
 ```
 
-CGI localhost voting is disabled unless `JCOMMENT_LOCALHOST_VOTING_ENABLED=1` is set for development. For deployed non-localhost traffic, voting requires the per-site login flow unless `JCOMMENT_LOGIN_ENABLED=0` is set. If login is disabled and voting remains enabled, upvotes are intentionally low-integrity and easy to manipulate; set `JCOMMENT_VOTING_ENABLED=0` when that is not acceptable.
+CGI localhost voting is disabled unless `JCOMMENT_LOCALHOST_VOTING_ENABLED=1` is set for development. For deployed non-localhost traffic, voting requires the per-site login flow. If login is disabled and voting remains enabled, non-localhost votes are rejected because the CGI server has no durable vote identity; set `JCOMMENT_VOTING_ENABLED=0` when voting should be unavailable.
 
-Set `JCOMMENT_REQUIRE_LOGIN_TO_POST=1` to reject comment posting unless the request includes a valid bearer token for that site. This does not affect reading comments.
+Set `JCOMMENT_REQUIRE_LOGIN_TO_POST=1` to reject comment posting unless the request includes a valid bearer token for that site. This requires `JCOMMENT_LOGIN_ENABLED=1` and does not affect reading comments.
 
 ## License
 

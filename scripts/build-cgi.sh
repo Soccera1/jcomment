@@ -10,3 +10,5 @@ zig build-exe \
   -O ReleaseSmall \
   -femit-bin=dist/jcomment-cgi \
   server/cgi/jcomment_cgi.zig
+
+rm -f dist/jcomment-cgi.o

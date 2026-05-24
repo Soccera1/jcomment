@@ -9,3 +9,5 @@ zig build-exe \
   -O ReleaseSmall \
   -femit-bin=dist/jcomment-demo \
   server/demo_server.zig
+
+rm -f dist/jcomment-demo.o
